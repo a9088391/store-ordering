@@ -6,7 +6,7 @@
 
 ## 本機啟動
 
-需有使用本機 Unix socket 的 Docker Engine、Docker Compose、`openssl`，以及 Chrome 或 Chromium。首次建置需連線取得官方容器映像及鎖檔中的套件。預設展示埠為 `127.0.0.1:8010`，請先確認該埠可用。
+在專案根目錄執行下列命令。本機驗收環境是 Apple Silicon Mac、使用本機 Unix socket 的 Docker Engine、Docker Compose、`openssl` 與桌面版 Chrome 或 Chromium。首次建置需連線取得官方容器映像及鎖檔中的套件。預設展示埠為 `127.0.0.1:8010`，請先確認該埠可用。
 
 ```sh
 ./bin/local demo up
@@ -20,7 +20,22 @@
 | `taipei@example.test` | 台北門市 |
 | `taichung@example.test` | 台中門市 |
 
-登入後可在「門市庫存」查閱濾掛咖啡與燕麥餅乾。台中門市的燕麥餅乾庫存為 0，可用來確認門市範圍和零庫存顯示。使用頁首「登出」結束 session。
+登入後可在「門市庫存」查閱示範品項。新環境的實體與可售庫存相同。既有環境請先記下畫面的實際數量。
+
+| 商品 | 單價（TWD） | 台北初始庫存 | 台中初始庫存 |
+| --- | ---: | ---: | ---: |
+| 濾掛咖啡 | 45 | 12 | 4 |
+| 燕麥餅乾 | 60 | 3 | 0 |
+
+### 展示路線
+
+以下數字以初始庫存為例。要在隔離站練習，可先執行 `./bin/local test up`，改用 [8011 測試站](http://127.0.0.1:8011) 及 `.local/test/accounts.json`。切換帳號時先從頁首登出。
+
+1. **台北店員建立多品項訂單。**在「建立訂單」依序選濾掛咖啡及燕麥餅乾，各按一次「新增品項」，分別填 2、1，按「建立訂單」。記下訂單編號。詳情應顯示待付款、總額 150 元及兩筆保留，咖啡與餅乾的實體／可售庫存分別是 12／10、3／2。按「發起付款」，記下付款識別，確認訂單進入付款處理中，庫存維持原值。
+2. **台中店員確認隔離與缺貨。**庫存應顯示咖啡 4／4、餅乾 0／0，畫面只有台中門市，且沒有總部模擬付款面板。以台北的訂單編號套用篩選，應查不到訂單。清除篩選，嘗試各買 1 件咖啡及餅乾。應收到可售庫存不足，兩個品項數量與訂單清單均不變。移除餅乾、重新建立 1 件咖啡的訂單並發起付款。記下台中訂單編號與付款識別，咖啡應為 4／3。
+3. **總部完成成功付款並重送。**在「總部模擬付款」按「重新載入付款」，以台北訂單編號與付款識別核對同一列，按「決定成功」再按「立即送出／重送」，記下畫面顯示的通知事件識別。切至台北門市，在「訂單清單」依編號套用篩選，點「查看訂單 #編號」。若通知尚在排程，稍候再開同一筆詳情。訂單與付款應同為「已付款」，兩品項各有一筆保留、扣除及釋放。重新整理頁面並選台北門市，庫存應為 10／10、2／2。再次按同列的「立即送出／重送」，應顯示相同的事件識別。在測試站可依「派送與重啟核對」確認第二次實際送達，再重新整理、開詳情，比對歷程與庫存數量。
+4. **總部確認失敗、重啟及延遲通知。**在台中訂單對應的付款列按「決定失敗」，再按「延遲 60 秒送出」並記下事件識別。在通知送達前查看台中訂單，應仍為付款處理中且咖啡為 4／3。依本頁的重啟命令操作，測試站使用 `./bin/local test restart`。自排入通知約 60 秒後，重新整理頁面、選台中門市，再開同一筆詳情。應顯示同一付款識別，訂單及付款均為「付款失敗」，只有一筆保留與一筆釋放，台中咖啡回到 4／4。台北的成功訂單、歷程與扣庫存結果應保留。用測試手冊比對重啟與送達時間。先確認通知已結算，再試「查詢付款結果」，因為人工查詢也會同步結果。
+5. **試走取消及到期。**各建一張只有 1 件咖啡的台中訂單。第一張按「取消訂單」，第二張保持待付款滿 15 分鐘。到期後重新整理頁面、選台中門市，依編號打開詳情。兩張應分別顯示「已取消」與「已到期」，各釋放一次保留，咖啡實體庫存仍為 4。完成後登出。
 
 在訂單區選擇商品，按「新增品項」並填寫數量，再按「建立訂單」。所有品項都有足夠可售量才成立。後端保存下單時的單價、數量與金額，並保留各品項庫存。提交結果不明時，在原分頁使用同一帳號及門市，按「確認同一筆訂單」以原鍵重送。若已關閉原分頁，先從訂單清單確認是否成立。
 
@@ -28,7 +43,7 @@
 
 在待付款的訂單詳情按「發起付款」，記下訂單編號。進入處理中後，訂單會保留庫存並顯示固定的付款識別。若連線中斷，先重新讀取原訂單。仍待付款時可再按「發起付款」。尚未確認建立的付款會由背景補辦，服務重啟後沿用原識別與剩餘次數。最多補辦三次。若顯示「自動補辦已達上限」，庫存仍會保留，可按「查詢付款結果」繼續處理同一筆付款。
 
-總部登入後，在「總部模擬付款」面板按「重新載入付款」，依訂單編號找出該筆付款，再按「決定成功」或「決定失敗」。決定結果後，可在同一筆付款選擇立即派送或延遲 60 秒派送。再次選擇立即派送會重送原通知。面板確認排入後，回原訂單重新開啟詳情查看通知結果，或按「查詢付款結果」人工同步。成功會扣除實體庫存並解除保留，失敗只解除保留。訂單詳情會顯示付款狀態、歷程、庫存異動及異常；結果待確認時，庫存會繼續保留。
+總部面板的派送回應表示通知已排入。要確認是否結算，以訂單詳情的付款狀態、歷程及庫存異動為準。付款確認後，終局不可反轉。明確失敗後如要再購買，請建立新訂單。
 
 `.local/demo/` 保存應用程式密鑰、訂單和模擬金流的資料庫密碼、通知簽章金鑰及初始帳密，請留在本機私密位置。建置及啟動只顯示帳密檔路徑。請一併備份私密設定與 PostgreSQL 資料。若只遺失通知金鑰，`up` 會產生新金鑰並讓兩端一起使用，待送通知仍沿用原事件。其他私密檔案遺失時，須從本機備份復原。
 
@@ -54,7 +69,9 @@
 
 重設途中若失敗，請先閱讀錯誤。若新資料卷已建立但尚未登記，使用同模式的 `up` 補完初始化；其他重設失敗可重跑同模式的 `reset`。若程序被強制終止並留下 `/tmp/store-ordering.local.lock` 或 `/tmp/store-ordering-test.local.lock`，先確認原命令及其 Docker 子程序都已結束，再以 `rmdir` 移除該模式的鎖目錄。若要還原重設前的環境，須使用同一時間點的 volume 與私密設定備份。
 
-## 開發與驗證
+## 架構與開發
+
+瀏覽器從訂單應用載入 Vue 頁面並呼叫同源 API。訂單應用保存帳號、庫存、訂單、付款意圖及交易歷程。獨立的模擬金流服務保存付款結果、通知事件與派送待辦，以內部 HTTP 回應查詢及送出簽章通知。兩個服務各自使用 PostgreSQL 資料庫與服務帳號。通知與人工查詢共用結算路徑，在一個訂單資料庫交易內更新訂單、庫存與歷程。
 
 - `backend/routes/web.php` 註冊同源 JSON API。登入與登出要帶 `GET /api/session` 回傳的 `csrfToken`，以 `X-CSRF-TOKEN` 送出。登入和登出回應會提供新的 token。
 - 請求本文最多 64 KiB。PHP 原生解析的 multipart POST 需要可確認的 `Content-Length`。超限或長度無法確認時回傳 `413 PAYLOAD_TOO_LARGE`。
@@ -84,20 +101,85 @@
 - `frontend/src/` 是 Vue 單頁入口。Vite 建置時執行 TypeScript 型別檢查並產生 Laravel 讀取的資產 manifest。修改前端或後端後，用 `up` 重建對應映像。
 - 展示與測試使用不同 Compose 專案、資料庫容器、volume、應用程式密鑰、通知簽章金鑰與 session cookie 名稱。各專案上限為 2 CPU、3 GiB，兩組同時啟動合計上限為 4 CPU、6 GiB。PostgreSQL 及模擬金流僅在各自的 Docker 網路內提供服務。訂單與模擬金流各自擁有資料庫與服務帳號，兩者透過 HTTP 交換付款資料。首次升級執行 `up` 會在各模式的 `.local/` 設定內補建 `payment-notifications.env`，並保留既有應用密鑰、帳密和資料。簽章金鑰只提供給模擬金流排程器和訂單網站。
 
+## 測試手冊
+
+先在初始庫存的隔離測試站執行自動化瀏覽器測試，再跑上面的展示路線。展示中的成功付款會實際扣減測試庫存。若打算再次使用需要初始庫存的腳本，請依重設章節核對並確認清除範圍。
+
 ```sh
 ./bin/local test up
 ./bin/local test phpunit
-(cd frontend && npm ci && npm run test:browser)
-./bin/local test down
+(cd frontend && npm ci && npm run typecheck && npm run build && npm run test:browser)
 ```
+
+瀏覽器腳本會用掉同一來源的五次登入額度。腳本結束後等滿 60 秒，再從同一來源重跑、走展示路線或做 API 登入。若已收到 `429 LOGIN_THROTTLED`，可依回應的 `Retry-After` 秒數等候。
+
+完成瀏覽器、HTTP 及重啟檢查後，執行 `./bin/local test down` 停止測試站並保留資料。
 
 可先執行 `bash bin/test-reset-guards` 檢查確認與目標保護。該測試使用臨時設定及模擬的 Docker 指令。
 
 測試網站為 `http://127.0.0.1:8011`，瀏覽器帳密由 `.local/test/accounts.json` 提供。PHPUnit 透過 Laravel HTTP 測試入口使用測試專案內的 `store_ordering_phpunit`。實際 HTTP 和瀏覽器使用同一測試專案內獨立的 `store_ordering_test`。
 
-瀏覽器測試需要主機 Node.js 22.12 以上，預設使用 macOS 安裝的 Google Chrome。使用其他 Chrome 或 Chromium 時，可在執行 `npm run test:browser` 前設定 `CHROME_PATH`。瀏覽器流程會送出五次登入，相同來源重跑前請等上一個 60 秒限流時窗結束。如果測試在建單後中斷，先在隔離測試站查閱這次的測試訂單。待付款的訂單可取消或等候到期。若訂單已進入付款處理中，先用原訂單的「查詢付款結果」確認或補建同一筆付款。總部在「總部模擬付款」找到該筆付款，若仍待決定就按「決定失敗」。回原訂單再次查詢，確認付款失敗及保留釋放。核對可售量回到測試前的數量後，再重跑瀏覽器測試。
+瀏覽器測試需要主機 Node.js 22.12 以上，預設使用 macOS 安裝的 Google Chrome。使用其他 Chrome 或 Chromium 時，可在執行 `npm run test:browser` 前設定 `CHROME_PATH`。如果測試在建單後中斷，先在隔離測試站查閱這次的測試訂單。待付款的訂單可取消或等候到期。若訂單已進入付款處理中，先用原訂單的「查詢付款結果」確認或補建同一筆付款。總部在「總部模擬付款」找到該筆付款，若仍待決定就按「決定失敗」。回原訂單再次查詢，確認付款失敗及保留釋放。核對可售量回到測試前的數量後，再重跑瀏覽器測試。
 
-實際服務的安全檢查可先取得 `GET /api/session` 的 cookie 與 `csrfToken`，再用同一 cookie 呼叫 `POST /api/login`。省略或改錯 `X-CSRF-TOKEN` 時應收到 `419 CSRF_MISMATCH`。正確登入後，對 `POST /api/logout` 分別省略或改錯 token，兩次都應回 419，且原 cookie 仍可查詢 `GET /api/stores`。使用正確 token 登出後，重送舊 cookie 查詢門市應回 `401 UNAUTHENTICATED`。Chrome 可分別以三個帳號登入，核對可選門市與庫存數量。
+實際服務的安全檢查可先取得 `GET /api/session` 的 cookie 與 `csrfToken`，再用同一 cookie 呼叫 `POST /api/login`。省略或改錯 `X-CSRF-TOKEN` 時應收到 `419 CSRF_MISMATCH`。成功登入後，用回應的 `Set-Cookie` 更新 cookie jar，並使用回應本文的新 token。對 `POST /api/logout` 和合法內容的 `POST /api/orders` 分別省略或改錯 token，應回 419。以該登入 cookie 查詢 `GET /api/stores` 仍應成功，訂單清單與庫存也應維持原值。使用正確 token 登出後，重送登出前的登入 cookie 查詢門市應回 `401 UNAUTHENTICATED`。Chrome 可分別以三個帳號登入，核對可選門市與庫存數量。
+
+驗收重設時，在隔離站記下既有訂單與庫存，先執行 `./bin/local test reset` 並直接按 Enter。確認命令取消後，查回原訂單、庫存及歷程。確定可以清除畫面列出的測試資料後，再重新執行重設並輸入正確的確認字串。重設完成後驗證舊 session 失效，以新初始密碼登入，兩店訂單清單應為空白，庫存應回到上表數量。
+
+### 派送與重啟核對
+
+僅在 8011 隔離站操作。執行下列指令後貼上要查的通知事件識別。第一列依序顯示排入數、已送達數、首次送達時間。第二列是訂單資料庫的成功收件數。對展示路線的新成功訂單，第一次派送後應為 1 次送達及 1 筆收件。再送一次後應為 2 次送達及 1 筆收件，詳情與庫存維持成功結算後的數值。
+
+```sh
+printf '通知事件識別\n'
+IFS= read -r event_id
+docker exec -i --user postgres store-ordering-test-db-1 psql -XAt -v ON_ERROR_STOP=1 \
+  -d store_ordering_mock_payment_test -v "event_id=$event_id" <<'SQL'
+SELECT count(*), count(delivered_at), min(delivered_at) AT TIME ZONE 'UTC'
+FROM payment_notification_dispatches WHERE event_id = :'event_id'::uuid;
+SQL
+docker exec -i --user postgres store-ordering-test-db-1 psql -XAt -v ON_ERROR_STOP=1 \
+  -d store_ordering_test -v "event_id=$event_id" <<'SQL'
+SELECT count(*) FROM payment_notification_receipts
+WHERE event_id = :'event_id'::uuid AND status = 200;
+SQL
+```
+
+延遲案例在重啟前查同一事件，應有 1 筆排入、0 筆送達及 0 筆收件。重啟後用 `docker inspect store-ordering-test-mock-payment-scheduler-1 --format '{{.State.StartedAt}}'` 取得排程器啟動時間。通知送達後再查，應有 1 筆送達及 1 筆收件，首次送達的 UTC 時間須晚於排程器重啟的時間。若重啟前已送達，請用新的測試訂單重做延遲案例。
+
+### 隔離站併發驗收
+
+在 8011 登入總部，選台北門市。兩個情境都可用下面的門市列鎖確認請求確實重疊。先備妥要送出的操作，再開一個終端執行 `docker exec -it --user postgres store-ordering-test-db-1 psql -X -d store_ordering_test` 並輸入：
+
+```sql
+SET idle_in_transaction_session_timeout = '45s';
+BEGIN;
+SELECT id FROM stores WHERE id = 1 FOR UPDATE;
+```
+
+在另一個終端開同一個 `psql` 命令，輸入下面的查詢，並用 `\watch 0.2` 重複查看。觀察到兩筆等待後，立即在持鎖的終端執行 `ROLLBACK;` 釋放鎖。若操作失敗或中斷，也先執行 `ROLLBACK;`。
+
+```sql
+SELECT count(*) FROM pg_stat_activity
+WHERE datname = current_database() AND usename = 'store_ordering'
+  AND wait_event_type = 'Lock' AND query ILIKE '%from "stores"%'
+  AND query ILIKE '%FOR NO KEY UPDATE%';
+```
+
+- **最後一件庫存。**用兩個獨立瀏覽器會話分別登入總部與台北店員，例如一般視窗與無痕視窗。先用一張待付款訂單把台北濾掛咖啡留到可售 1 件。取得門市鎖後，在兩個會話的開發者工具 Console 各執行下面的指令一次。程式會各自產生操作鍵。釋放鎖後應只得到一個 `201` 和一個 `409 INSUFFICIENT_STOCK`。台北可售變 0、實體庫存維持原值，台中數量不變。取消兩張成立的待付款訂單，確認台北可售量恢復。
+
+  ```js
+  const { csrfToken } = await (await fetch('/api/session')).json()
+  const result = await fetch('/api/orders', {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-CSRF-TOKEN': csrfToken },
+    body: JSON.stringify({
+      storeId: 1, operationKey: crypto.randomUUID(), items: [{ productId: 1, quantity: 1 }],
+    }),
+  })
+  console.log(result.status, await result.json())
+  ```
+
+- **通知與人工查詢。**用新的台北訂單發起付款，總部決定失敗後先保留訂單詳情和付款列。取得鎖後，按詳情的「查詢付款結果」。觀察到一筆等待時，在同一頁的付款列按「立即送出／重送」。見到兩筆等待即釋放鎖，讓兩個請求繼續。依前節確認事件已送達，重新整理核對同一付款識別、唯一的失敗終局、一筆釋放及實體庫存不變。若未觀察到兩筆同時等待，請用新訂單重跑該情境。
 
 ### 負載驗收
 
@@ -132,6 +214,7 @@ project="store-ordering-$load_mode"
 while :; do
     date -u
     uptime
+    top -l 1 -n 0 | awk '/^(CPU usage|PhysMem|Load Avg)/'
     docker stats --no-stream "${project}-app-1" "${project}-db-1" "${project}-scheduler-1" \
         "${project}-mock-payment-1" "${project}-mock-payment-scheduler-1"
     sleep 5
@@ -159,3 +242,20 @@ docker logs --timestamps "${project}-mock-payment-1" > "$evidence/mock-access.lo
 產生器以測試金鑰簽署模擬金流實際保存的事件本文，按排程送至訂單通知入口，量測驗簽及結算。金流的派送佇列、輪詢、重送、故障與競爭由獨立測試驗證。發起付款與決定結果引發的內部 HTTP 會佔用服務資源，其耗時也包含在入口量測內。
 
 `.local/$load_mode/benchmark/` 保存逐筆請求、未送出原因、兩個資料庫的一致性核對及摘要。腳本的通過訊息涵蓋正式流量與配比、交易完整性、讀取 p95 ≤500 毫秒、交易操作 p95 ≤1 秒、非預期錯誤率 <1% 和正確性錯誤為 0。完整驗收另須核對實際內部 HTTP、版本、配額與資源採樣。量測中斷或未通過時保留證據，重新驗收請使用新識別。`down` 保留資料卷與私密設定，供測後檢查。
+
+#### 本機實測摘要
+
+2026-11-07 在 Apple M3、24 GiB RAM、macOS 27.0.1 上，以 Docker Engine 29.8.2、Compose 5.5.0、PHP 8.5.12、Laravel 13.40.0 與 PostgreSQL 18.6 執行。本案容器合計配額為 4 CPU、6 GiB。起始有 10,000 筆歷史訂單，暖機 60 秒，正式量測 300 秒。
+
+| 項目 | 正式量測 | 驗收門檻 |
+| --- | ---: | ---: |
+| 入口請求 | 6,000（每秒 20 次） | 6,000（每秒 20 次） |
+| 讀取 p95 | 27.07 毫秒 | ≤500 毫秒 |
+| 交易操作 p95 | 36.71 毫秒 | ≤1 秒 |
+| 未送出的排定請求 | 0 | 0 |
+| 非預期錯誤 | 0（0%） | <1% |
+| 交易正確性錯誤 | 0 | 0 |
+
+兩店各完成 300 組交易，其中各 240 組成功、60 組明確失敗。另觀察到 1,200 次衍生的內部 HTTP（建立付款 600 次、決定結果 600 次）。測後核對含暖機共 720 筆新增訂單的付款、庫存及歷程，結果一致。交易 p95 衡量單次入口操作。回呼使用模擬金流保存的事件本文送到實際驗簽與結算端點，派送佇列的輪詢與等待時間由獨立測試涵蓋。
+
+正式量測期間，每個負載容器採樣 32 次。主機的 1 分鐘平均負載介於 2.10～3.64，CPU 閒置率介於 61.50%～75.57%。訂單應用的抽樣峰值為單核心的 25.42% 與 81.64 MiB 記憶體，PostgreSQL 為 18.62% 與 65.17 MiB。
