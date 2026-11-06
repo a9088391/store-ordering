@@ -4,15 +4,19 @@ import {
   ApiError,
   cancelOrder,
   createOrder,
+  queryPayment,
   getOrder,
   getOrders,
   isPositiveSafeInteger,
   readOrderDraft,
+  startPayment,
   type InventoryItem,
   type OrderDetail,
   type OrderDraft,
   type OrderFilters,
   type OrderPage,
+  type PaymentAnomaly,
+  type PendingPaymentReason,
   type OrderStatus,
   type Store,
 } from './api'
@@ -23,6 +27,8 @@ const emit = defineEmits<{ sessionExpired: []; stockChanged: [] }>()
 type DraftLine = { productId: number; name?: string; quantity: string }
 type PendingOrder = { body: string; draft: OrderDraft }
 type CancelResult = 'cancelled' | 'conflict' | 'unknown' | 'not-found'
+type PaymentAction = 'start' | 'query'
+type PaymentResult = 'confirmed' | 'conflict' | 'unknown' | 'not-found'
 
 // 元件依門市與登入帳號重建，請求及待確認操作都使用該次掛載的範圍。
 const storeId = props.store.id
@@ -51,7 +57,11 @@ const detailError = ref('')
 const detailHeading = useTemplateRef<HTMLHeadingElement>('detailHeading')
 const cancelling = ref(false)
 const cancelResult = ref<CancelResult | null>(null)
+const paymentAction = ref<PaymentAction | null>(null)
+const paymentResult = ref<PaymentResult | null>(null)
 let detailRead: AbortController | undefined
+// 付款識別屬於目前帳號、門市及選取的訂單，詳情讀取失敗時仍保留。
+let selectedPaymentId: string | undefined
 
 const statusLabels: Record<OrderStatus, string> = {
   awaiting_payment: '待付款',
@@ -60,6 +70,22 @@ const statusLabels: Record<OrderStatus, string> = {
   failed: '付款失敗',
   cancelled: '已取消',
   expired: '已到期',
+}
+const paymentStatusLabels = { pending: '待確認', paid: '已付款', failed: '付款失敗' }
+const pendingReasonLabels: Record<Exclude<PendingPaymentReason, null>, string> = {
+  creation_unconfirmed: '付款建立尚未確認',
+  awaiting_result: '等待模擬付款結果',
+  service_unavailable: '模擬付款服務暫時無法使用',
+  payment_not_found: '尚未查到遠端付款',
+  invalid_response: '付款回應內容待確認',
+}
+const anomalyLabels: Record<PaymentAnomaly['reason'], string> = {
+  invalid_response: '付款回應無效',
+  payment_id_mismatch: '付款識別不符',
+  order_id_mismatch: '訂單識別不符',
+  amount_mismatch: '付款金額不符',
+  currency_mismatch: '付款幣別不符',
+  terminal_conflict: '付款終局狀態衝突',
 }
 const numberFormat = new Intl.NumberFormat('zh-TW')
 const dateFormat = new Intl.DateTimeFormat('zh-TW', {
@@ -77,7 +103,7 @@ const selectableProducts = computed(() => {
 const selectedProduct = computed(() => selectableProducts.value.find((product) => product.id === productId.value))
 
 // 同時只執行一筆寫入，避免建單與取消互相取代目前詳情。
-const writeBusy = computed(() => creating.value || cancelling.value)
+const writeBusy = computed(() => creating.value || cancelling.value || paymentAction.value !== null)
 
 // 用回讀狀態說明原訂單的下一步，讀取失敗時維持結果待確認。
 const cancelFeedback = computed(() => {
@@ -90,6 +116,32 @@ const cancelFeedback = computed(() => {
     return '取消結果尚未確認。訂單目前仍為待付款，可以再次取消這筆訂單。'
   }
   return detail.value ? '已讀取訂單狀態，目前無法取消。' : '取消結果尚未確認，請確認這筆訂單的詳情。'
+})
+
+// 未知結果以安全回讀的目前狀態說明，避免暗示已完成或自動重送。
+const paymentFeedback = computed(() => {
+  if (paymentResult.value === 'confirmed') {
+    if (detail.value?.status === 'paid') return '已確認付款成功。'
+    if (detail.value?.status === 'failed') return '已確認付款失敗，保留庫存已釋放。'
+    return '已確認付款仍在處理中，庫存持續保留。'
+  }
+  if (paymentResult.value === 'conflict') {
+    return detail.value
+      ? '付款狀態已變更，已重新讀取這筆訂單。'
+      : '付款狀態發生衝突，詳情尚未確認，請重新讀取訂單。'
+  }
+  if (paymentResult.value === 'not-found') return '找不到這筆訂單，請重新讀取訂單清單。'
+  if (paymentResult.value !== 'unknown') return ''
+  if (detail.value?.status === 'awaiting_payment') {
+    return '付款操作結果尚未確認；訂單仍待付款。請確認訂單後再手動發起，系統不會自動重送。'
+  }
+  if (detail.value?.status === 'processing') {
+    return '付款操作結果尚未確認；同一筆付款仍在處理中。可手動查詢付款結果，系統不會自動重送。'
+  }
+  if (detail.value?.status === 'paid' || detail.value?.status === 'failed') {
+    return `已回讀目前訂單狀態：${statusLabels[detail.value.status]}。可手動查詢最新付款結果。`
+  }
+  return '付款結果尚未確認。請重新讀取訂單詳情後手動查詢；系統不會自動重送付款操作。'
 })
 
 // 以同一組空值初始化或清除已套用的篩選條件。
@@ -201,6 +253,12 @@ async function submitOrder(): Promise<void> {
     // 確認帳號、門市及品項後才解除草稿鎖定，並回讀清單與庫存。
     const order = await createOrder(attempt.body, attempt.draft, actorId, props.csrfToken, lifetime.signal)
     if (lifetime.signal.aborted) return
+    // 確認同一張訂單時，已知的付款識別必須與重送回應一致。
+    if (
+      selectedOrder.value === order.id
+      && selectedPaymentId
+      && order.payment?.id !== selectedPaymentId
+    ) throw new Error('建單重送回應與已知付款識別不符。')
     if (clearPending(attempt)) {
       lines.value = []
       productId.value = null
@@ -208,11 +266,14 @@ async function submitOrder(): Promise<void> {
     } else {
       createFeedback.value = `已確認訂單 #${order.id}。瀏覽器仍保留待確認紀錄。`
     }
+    // 建單確認後改顯示該筆詳情，清除前次操作的回饋。
     detailRead?.abort()
     selectedOrder.value = order.id
+    selectedPaymentId = order.payment?.id
     detail.value = order
     detailError.value = ''
     cancelResult.value = null
+    paymentResult.value = null
     listRefresh.value++
     emit('stockChanged')
     void focusDetail(order.id)
@@ -279,20 +340,29 @@ watch([filters, page, listRefresh], async ([query, currentPage], [previousQuery]
   }
 }, { immediate: true })
 
-// 詳情獨立取消過期讀取，失敗時隱藏舊狀態及其操作。
-async function readDetail(id: number): Promise<void> {
+// 詳情獨立取消過期讀取，並保留已知付款識別以核對同一筆交易。
+async function readDetail(id: number, manualRetry = false): Promise<void> {
   detailRead?.abort()
   const controller = new AbortController()
   detailRead = controller
+  if (selectedOrder.value !== id) selectedPaymentId = undefined
   selectedOrder.value = id
   detail.value = null
   detailError.value = ''
 
   try {
-    // 只接受這次選取仍有效的結果。
+    // 切換訂單、門市或帳號會中止舊讀取，只接受仍屬於目前詳情的結果。
     const order = await getOrder(id, storeId, controller.signal)
     if (controller.signal.aborted) return
+    if (selectedPaymentId && order.payment?.id !== selectedPaymentId) throw new Error('付款識別與先前讀取不符。')
+    selectedPaymentId = order.payment?.id
     detail.value = order
+
+    // 人工重試成功時，先前不明的付款可能已結算，連同清單與庫存一起更新。
+    if (manualRetry && paymentResult.value === 'unknown') {
+      listRefresh.value++
+      emit('stockChanged')
+    }
   } catch (error) {
     if (controller.signal.aborted) return
     if (needsSession(error)) emit('sessionExpired')
@@ -304,10 +374,11 @@ async function readDetail(id: number): Promise<void> {
   }
 }
 
-// 開啟另一筆訂單時，不沿用前一筆的取消結果。
+// 從清單開啟詳情時，清除先前的取消及付款回饋。
 function viewOrder(id: number): void {
   if (writeBusy.value) return
   cancelResult.value = null
+  paymentResult.value = null
   void readDetail(id)
   void focusDetail(id)
 }
@@ -355,6 +426,60 @@ async function requestCancel(): Promise<void> {
     await readDetail(order.id)
   } finally {
     cancelling.value = false
+  }
+}
+
+// 僅由明確操作發起或查詢付款；任何不明回應都回讀原訂單而不重送。
+async function requestPayment(action: PaymentAction): Promise<void> {
+  const order = detail.value
+  if (writeBusy.value || !order) return
+  if (action === 'start' && order.status !== 'awaiting_payment') return
+  if (action === 'query' && !['processing', 'paid', 'failed'].includes(order.status)) return
+
+  paymentAction.value = action
+  paymentResult.value = null
+  try {
+    try {
+      // 每個付款操作只送出一次；正常回應須通過 API 層的訂單及付款驗證。
+      const updated = action === 'start'
+        ? await startPayment(order.id, storeId, props.csrfToken, lifetime.signal)
+        : await queryPayment(order.id, storeId, props.csrfToken, lifetime.signal)
+      if (lifetime.signal.aborted) return
+      if (selectedOrder.value === order.id) {
+        if (selectedPaymentId && updated.payment?.id !== selectedPaymentId) {
+          throw new Error('付款操作回應更換了付款識別。')
+        }
+        selectedPaymentId = updated.payment?.id
+        detail.value = updated
+        detailError.value = ''
+        paymentResult.value = 'confirmed'
+      }
+    } catch (error) {
+      // 舊會話不再擁有畫面；其餘拒絕或不明結果都先安全回讀。
+      if (lifetime.signal.aborted) return
+      if (needsSession(error)) {
+        emit('sessionExpired')
+        return
+      }
+      if (error instanceof ApiError && error.status === 404 && error.code === 'NOT_FOUND') {
+        paymentResult.value = 'not-found'
+      } else if (error instanceof ApiError && error.status === 409 && error.code === 'ORDER_STATE_CONFLICT') {
+        paymentResult.value = 'conflict'
+      } else {
+        paymentResult.value = 'unknown'
+      }
+    }
+
+    // 先等不明回應的詳情回讀，再刷新清單與庫存，避免讀到較早的狀態。
+    if (selectedOrder.value === order.id && paymentResult.value !== 'confirmed') {
+      await readDetail(order.id)
+    }
+    if (lifetime.signal.aborted) return
+    listRefresh.value++
+    emit('stockChanged')
+    if (selectedOrder.value === order.id) void focusDetail(order.id)
+  } finally {
+    paymentAction.value = null
   }
 }
 
@@ -470,9 +595,13 @@ onBeforeUnmount(() => {
     <section v-if="selectedOrder !== null" class="order-section" aria-labelledby="order-detail-heading">
       <h3 id="order-detail-heading" ref="detailHeading" tabindex="-1">訂單 #{{ selectedOrder }}</h3>
       <p v-if="cancelFeedback" role="status">{{ cancelFeedback }}</p>
+      <p v-if="paymentFeedback" role="status">{{ paymentFeedback }}</p>
+      <p v-if="paymentAction" role="status">
+        {{ paymentAction === 'start' ? '正在發起付款…' : '正在查詢付款結果…' }}
+      </p>
       <div v-if="detailError" class="retry">
         <p role="alert">{{ detailError }}</p>
-        <button type="button" :disabled="writeBusy" @click="readDetail(selectedOrder)">重新讀取訂單詳情</button>
+        <button type="button" :disabled="writeBusy" @click="readDetail(selectedOrder, true)">重新讀取訂單詳情</button>
       </div>
       <p v-else-if="!detail" role="status">正在讀取訂單詳情…</p>
       <template v-else>
@@ -483,6 +612,14 @@ onBeforeUnmount(() => {
           <dt>建立人編號</dt><dd>{{ detail.createdBy }}</dd>
           <dt>建立時間</dt><dd>{{ dateFormat.format(new Date(detail.createdAt)) }}</dd>
           <dt>到期時間</dt><dd>{{ dateFormat.format(new Date(detail.expiresAt)) }}</dd>
+          <dt>付款識別</dt>
+          <dd v-if="detail.payment" class="payment-id">{{ detail.payment.id }}</dd>
+          <dd v-else>尚未建立付款</dd>
+          <template v-if="detail.payment">
+            <dt>付款狀態</dt><dd>{{ paymentStatusLabels[detail.payment.status] }}</dd>
+            <dt v-if="detail.payment.pendingReason">待處理原因</dt>
+            <dd v-if="detail.payment.pendingReason">{{ pendingReasonLabels[detail.payment.pendingReason] }}</dd>
+          </template>
         </dl>
         <h4>訂購明細</h4>
         <ul>
@@ -500,11 +637,18 @@ onBeforeUnmount(() => {
         <h4>庫存異動紀錄</h4>
         <ol>
           <li v-for="(entry, index) in detail.stockLedger" :key="index">
-            {{ entry.type === 'reserved' ? '保留' : '釋放' }}
+            {{ entry.type === 'reserved' ? '保留' : entry.type === 'released' ? '釋放' : '扣除' }}
             {{ detail.items.find((item) => item.productId === entry.productId)?.name ?? `商品 #${entry.productId}` }}
             × {{ numberFormat.format(entry.quantity) }} · {{ dateFormat.format(new Date(entry.occurredAt)) }}
           </li>
         </ol>
+        <h4>付款異常紀錄</h4>
+        <ol v-if="detail.anomalies.length">
+          <li v-for="(anomaly, index) in detail.anomalies" :key="index">
+            {{ anomalyLabels[anomaly.reason] }} · {{ dateFormat.format(new Date(anomaly.occurredAt)) }}
+          </li>
+        </ol>
+        <p v-else>無付款異常紀錄。</p>
         <button
           v-if="detail.status === 'awaiting_payment'"
           class="secondary"
@@ -512,6 +656,18 @@ onBeforeUnmount(() => {
           :disabled="writeBusy"
           @click="requestCancel"
         >{{ cancelling ? '取消確認中…' : '取消訂單' }}</button>
+        <button
+          v-if="detail.status === 'awaiting_payment'"
+          type="button"
+          :disabled="writeBusy"
+          @click="requestPayment('start')"
+        >{{ paymentAction === 'start' ? '付款發起中…' : '發起付款' }}</button>
+        <button
+          v-else-if="['processing', 'paid', 'failed'].includes(detail.status)"
+          type="button"
+          :disabled="writeBusy"
+          @click="requestPayment('query')"
+        >{{ paymentAction === 'query' ? '查詢中…' : '查詢付款結果' }}</button>
       </template>
     </section>
   </section>

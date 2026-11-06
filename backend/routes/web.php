@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use App\Http\Controllers\CatalogController;
+use App\Http\Controllers\HeadquartersPaymentController;
 use App\Http\Controllers\OrderController;
 use App\Http\Controllers\SessionController;
 use Illuminate\Support\Facades\Route;
@@ -29,5 +30,13 @@ Route::prefix('api')
             Route::post('/orders', [OrderController::class, 'create']);
             Route::get('/orders/{order}', [OrderController::class, 'show'])->whereNumber('order');
             Route::post('/orders/{order}/cancel', [OrderController::class, 'cancel'])->whereNumber('order');
+            Route::post('/orders/{order}/payment', [OrderController::class, 'startPayment'])->whereNumber('order');
+            Route::post('/orders/{order}/payment/query', [OrderController::class, 'queryPayment'])
+                ->whereNumber('order');
+
+            // 面板使用同來源登入與 CSRF，控制器在對內外呼前另檢查總部角色。
+            Route::get('/mock-payments', [HeadquartersPaymentController::class, 'index']);
+            Route::post('/mock-payments/{paymentId}/decision', [HeadquartersPaymentController::class, 'decide'])
+                ->whereUuid('paymentId');
         });
     });

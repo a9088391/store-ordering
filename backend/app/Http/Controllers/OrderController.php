@@ -9,6 +9,7 @@ use App\Http\Responses\OrderData;
 use App\Http\Responses\PageData;
 use App\Orders\OrderConflict;
 use App\Orders\OrderReservation;
+use App\Payments\OrderPayments;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -16,9 +17,11 @@ use Illuminate\Support\Facades\Validator;
 
 final class OrderController
 {
-    // 依賴共用的庫存交易入口，讓開單、取消和庫存讀取採用相同鎖定。
-    public function __construct(private readonly OrderReservation $reservations)
-    {
+    // 訂單保留與付款共用庫存交易，付款另處理交易之外的遠端通訊。
+    public function __construct(
+        private readonly OrderReservation $reservations,
+        private readonly OrderPayments $payments,
+    ) {
     }
 
     // 先驗證篩選及門市權限，再依建立時間及訂單識別取得穩定頁面。
@@ -108,6 +111,28 @@ final class OrderController
 
         return $result instanceof OrderConflict
             ? $this->conflict($result)
+            : response()->json(['data' => $result]);
+    }
+
+    // 依本機交易資格發起付款，重送仍使用同一識別。
+    public function startPayment(Request $request, string $order): JsonResponse
+    {
+        return $this->paymentResponse($request, $order, start: true);
+    }
+
+    // 查詢可能更新本機結果，沿用登入、門市授權及瀏覽器 CSRF。
+    public function queryPayment(Request $request, string $order): JsonResponse
+    {
+        return $this->paymentResponse($request, $order, start: false);
+    }
+
+    // 兩個付款入口都回傳最新詳情，狀態不允許時保留既有的訂單衝突代碼。
+    private function paymentResponse(Request $request, string $order, bool $start): JsonResponse
+    {
+        $result = $this->payments->sync($request->user(), $this->orderId($order), $start);
+
+        return $result instanceof OrderConflict
+            ? response()->json(['code' => $result->value, 'message' => '此訂單目前無法執行付款操作。'], 409)
             : response()->json(['data' => $result]);
     }
 

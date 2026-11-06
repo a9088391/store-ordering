@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import { ApiError, getSession, login, logout, type Session } from './api'
+import HeadquartersPaymentsView from './HeadquartersPaymentsView.vue'
 import InventoryView from './InventoryView.vue'
 
 type SessionCheck = 'login' | 'logout' | 'expired'
@@ -166,6 +167,12 @@ onUnmounted(() => lifetime.abort())
       :actor-id="session.user.id"
       :csrf-token="session.csrfToken"
       @logout="changeSession('logout')"
+      @session-expired="refreshSession('expired')"
+    />
+    <!-- 總部付款清單與門市選取分離，門市載入失敗時仍可獨立顯示。 -->
+    <HeadquartersPaymentsView
+      v-if="session?.user?.role === 'headquarters'"
+      :csrf-token="session.csrfToken"
       @session-expired="refreshSession('expired')"
     />
   </main>

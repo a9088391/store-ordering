@@ -17,11 +17,20 @@ use Illuminate\Http\Request;
 use Illuminate\Validation\ValidationException;
 use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 
+// 服務角色由容器設定；同一映像只註冊該服務自己的 HTTP 路由。
+$mockPayment = getenv('STORE_ORDERING_SERVICE') === 'mock-payment';
+
 return Application::configure(basePath: dirname(__DIR__))
-    ->withRouting(web: __DIR__ . '/../routes/web.php', health: '/up')
+    ->withRouting(
+        web: $mockPayment ? null : __DIR__ . '/../routes/web.php',
+        api: $mockPayment ? __DIR__ . '/../routes/mock-payment.php' : null,
+        health: '/up',
+    )
     // 每分鐘清理已到期的訂單；庫存讀取及開單仍各自即時檢查到期。
-    ->withSchedule(function (Schedule $schedule): void {
-        $schedule->command('store-ordering:expire-orders')->everyMinute();
+    ->withSchedule(function (Schedule $schedule) use ($mockPayment): void {
+        if (!$mockPayment) {
+            $schedule->command('store-ordering:expire-orders')->everyMinute();
+        }
     })
     // 讓 API 沿用 web session，並於授權前檢查會話期限。
     ->withMiddleware(function (Middleware $middleware): void {
@@ -62,6 +71,7 @@ return Application::configure(basePath: dirname(__DIR__))
                 403 => ['FORBIDDEN', '您沒有執行此操作的權限。'],
                 404 => ['NOT_FOUND', '找不到指定資源。'],
                 405 => ['METHOD_NOT_ALLOWED', '不支援此請求方法。'],
+                409 => ['PAYMENT_STATE_CONFLICT', '付款內容或終局決定與已保存的紀錄衝突。'],
                 413 => [LimitRequestBody::ERROR_CODE, LimitRequestBody::ERROR_MESSAGE],
                 419 => ['CSRF_MISMATCH', '安全驗證已失效，請重新取得會話後再試。'],
                 422 => ['VALIDATION_FAILED', '欄位格式或範圍不正確。'],

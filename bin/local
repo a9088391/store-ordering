@@ -8,11 +8,13 @@ case "${1:-}" in
     demo)
         project=store-ordering
         export STORE_ORDERING_DATABASE=store_ordering STORE_ORDERING_PORT=8010
+        export STORE_ORDERING_MOCK_PAYMENT_DATABASE=store_ordering_mock_payment
         export STORE_ORDERING_SESSION_COOKIE=store_ordering_session
         ;;
     test)
         project=store-ordering-test
         export STORE_ORDERING_DATABASE=store_ordering_test STORE_ORDERING_PORT=8011
+        export STORE_ORDERING_MOCK_PAYMENT_DATABASE=store_ordering_mock_payment_test
         export STORE_ORDERING_SESSION_COOKIE=store_ordering_test_session
         ;;
     *)
@@ -43,7 +45,16 @@ esac
 
 # 讓私密值一律來自本模式的檔案，避免 Compose 優先套用外部 shell 的同名變數。
 unset STORE_ORDERING_APP_KEY STORE_ORDERING_DB_PASSWORD STORE_ORDERING_POSTGRES_PASSWORD
+unset STORE_ORDERING_MOCK_PAYMENT_DB_PASSWORD
 compose=(docker compose -f compose.yaml -p "$project" --env-file "$local_dir/runtime.env")
+mock_env="$local_dir/mock-payment.env"
+if [ -L "$mock_env" ]; then
+    printf '拒絕以符號連結存放模擬金流設定。\n' >&2
+    exit 1
+fi
+if [ -f "$mock_env" ]; then
+    compose+=(--env-file "$mock_env")
+fi
 
 # 原子建立權限為 0600 的檔案，重跑時沿用既有值，避免密鑰或密碼中途被覆寫。
 write_private_file() {
@@ -121,6 +132,29 @@ prepare_accounts() {
     chmod 600 "$local_dir/accounts.json"
 }
 
+# 既有環境只在尚無模擬金流角色時新增密碼，遺失的既有憑證須先復原。
+prepare_mock_password() {
+    local role_exists mock_password
+    if [ ! -f "$mock_env" ]; then
+        # 第 02 票的資料庫可安全補建；確認既有角色是否存在，避免建立錯誤的替代密碼。
+        if docker volume inspect "${project}_postgres-data" >/dev/null 2>&1; then
+            "${compose[@]}" up -d --wait db
+            role_exists="$("${compose[@]}" exec -T --user postgres db psql --no-psqlrc --tuples-only \
+                --no-align --username postgres --dbname postgres --set=ON_ERROR_STOP=1 \
+                --command "SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = 'store_ordering_mock_payment')")"
+            if [ "$role_exists" != f ] && [ ! -f "$mock_env" ]; then
+                printf '模擬金流角色已存在，請先復原 %s。\n' "$mock_env" >&2
+                return 1
+            fi
+        fi
+
+        mock_password="$(openssl rand -hex 24)"
+        write_private_file "$mock_env" "STORE_ORDERING_MOCK_PAYMENT_DB_PASSWORD=$mock_password"
+        compose+=(--env-file "$mock_env")
+    fi
+    chmod 600 "$mock_env"
+}
+
 case "$command" in
     up)
         # 資料庫就緒並完成遷移與冪等初始化後，才啟動網站與到期排程。
@@ -128,16 +162,19 @@ case "$command" in
         prepare_runtime
         prepare_accounts
         "${compose[@]}" build app
+        "${compose[@]}" stop app scheduler mock-payment
+        prepare_mock_password
         "${compose[@]}" up -d --wait db
-        "${compose[@]}" stop app scheduler
         # 每次 up 都核對並補齊本案資料庫資源，避免首次中斷留下半套環境。
         "${compose[@]}" exec -T --user postgres db bash /opt/store-ordering/init-db.sh
         "${compose[@]}" run --rm -T --no-deps app php artisan migrate --force
+        "${compose[@]}" run --rm -T --no-deps --pull never mock-payment \
+            php artisan migrate --force --path=database/mock-payment-migrations
         # macOS 主機檔案屬於目前使用者，單次初始化沿用容器 root 讀取 0600 檔案。
         "${compose[@]}" run --rm -T --no-deps --user root \
             -v "$PWD/$local_dir/accounts.json:/setup/accounts.json:ro" \
             app php artisan store-ordering:seed-demo /setup/accounts.json
-        "${compose[@]}" up -d --wait --no-build --pull never app scheduler
+        "${compose[@]}" up -d --wait --no-build --pull never app scheduler mock-payment
         printf '網站 http://127.0.0.1:%s，初始帳密 %s/accounts.json\n' \
             "$STORE_ORDERING_PORT" "$local_dir"
         ;;

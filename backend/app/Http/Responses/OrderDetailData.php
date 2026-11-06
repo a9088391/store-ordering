@@ -15,12 +15,20 @@ final readonly class OrderDetailData implements JsonSerializable
         private array $items,
         private array $history,
         private array $stockLedger,
+        private ?OrderPaymentData $payment,
+        private array $anomalies,
     ) {
     }
 
     // 各種資料列只映射契約所需的欄位，並保留呼叫端決定的順序。
-    public static function fromRows(object $order, Collection $items, Collection $history, Collection $ledger): self
-    {
+    public static function fromRows(
+        object $order,
+        Collection $items,
+        Collection $history,
+        Collection $ledger,
+        ?OrderPaymentData $payment,
+        array $anomalies,
+    ): self {
         return new self(
             OrderData::fromRow($order),
             // 品項是開單快照，保留當時的商品名稱及價格。
@@ -43,6 +51,8 @@ final readonly class OrderDetailData implements JsonSerializable
                 'type' => $event->type,
                 'occurredAt' => OrderData::isoDate($event->occurred_at),
             ])->all(),
+            $payment,
+            $anomalies,
         );
     }
 
@@ -53,8 +63,8 @@ final readonly class OrderDetailData implements JsonSerializable
             'items' => $this->items,
             'history' => $this->history,
             'stockLedger' => $this->stockLedger,
-            'payment' => null,
-            'anomalies' => [],
+            'payment' => $this->payment,
+            'anomalies' => $this->anomalies,
         ];
     }
 }

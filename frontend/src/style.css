@@ -163,6 +163,15 @@ th:first-child {
   overflow-wrap: anywhere;
 }
 
+.payment-panel {
+  margin-top: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.payment-id {
+  overflow-wrap: anywhere;
+}
+
 .order-section {
   display: grid;
   justify-items: start;
@@ -232,5 +241,14 @@ th:first-child {
   td {
     padding-inline: 0.25rem;
     font-size: 0.875rem;
+  }
+
+  .payment-panel td:last-child .order-actions {
+    flex-direction: column;
+  }
+
+  .payment-panel td:last-child button {
+    max-width: 100%;
+    min-width: 0;
   }
 }

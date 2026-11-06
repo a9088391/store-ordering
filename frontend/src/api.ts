@@ -67,12 +67,51 @@ export interface OrderPage {
   meta: InventoryPage['meta']
 }
 
+export type PaymentStatus = 'pending' | 'paid' | 'failed'
+export type PendingPaymentReason =
+  | 'creation_unconfirmed'
+  | 'awaiting_result'
+  | 'service_unavailable'
+  | 'payment_not_found'
+  | 'invalid_response'
+  | null
+
+export interface OrderPayment {
+  id: string
+  status: PaymentStatus
+  pendingReason: PendingPaymentReason
+}
+
+export interface PaymentAnomaly {
+  reason:
+    | 'invalid_response'
+    | 'payment_id_mismatch'
+    | 'order_id_mismatch'
+    | 'amount_mismatch'
+    | 'currency_mismatch'
+    | 'terminal_conflict'
+  occurredAt: string
+}
+
+export interface MockPayment {
+  paymentId: string
+  orderId: number
+  amount: number
+  currency: 'TWD'
+  status: PaymentStatus
+}
+
+export interface MockPaymentPage {
+  data: MockPayment[]
+  meta: InventoryPage['meta']
+}
+
 export interface OrderDetail extends OrderSummary {
   items: (OrderItemInput & { name: string; unitPrice: number; subtotal: number })[]
   history: { status: OrderStatus; occurredAt: string }[]
-  stockLedger: (OrderItemInput & { type: 'reserved' | 'released'; occurredAt: string })[]
-  payment: null
-  anomalies: []
+  stockLedger: (OrderItemInput & { type: 'reserved' | 'released' | 'deducted'; occurredAt: string })[]
+  payment: OrderPayment | null
+  anomalies: PaymentAnomaly[]
 }
 
 export class ApiError extends Error {
@@ -239,22 +278,27 @@ function isOrderSummary(order: OrderSummary | null | undefined, storeId: number)
   )
 }
 
-// 每個品項都須有一次等量保留；本票的取消或到期另須有一次等量釋放。
+// 付款終局須與訂單狀態、保留及庫存異動相符，避免誤確認遠端結果。
 function hasCompleteStockLedger(order: OrderDetail): boolean {
   // 建立各類異動應包含的品項，並先排除重複品項或筆數不符的回應。
   const reserved = new Map(order.items.map(({ productId, quantity }) => [productId, quantity]))
-  const releasesStock = order.status === 'cancelled' || order.status === 'expired'
+  const releasesStock = ['paid', 'failed', 'cancelled', 'expired'].includes(order.status)
   const released = new Map(releasesStock ? reserved : undefined)
+  const deducted = new Map(order.status === 'paid' ? reserved : undefined)
   if (
     reserved.size !== order.items.length
     || !Array.isArray(order.stockLedger)
-    || order.stockLedger.length !== reserved.size + released.size
+    || order.stockLedger.length !== reserved.size + released.size + deducted.size
   ) return false
 
   // 每個符合數量與時間格式的異動只能用掉一筆預期紀錄。
-  const remaining = { reserved, released }
+  const remaining = { reserved, released, deducted }
   for (const entry of order.stockLedger) {
-    if (entry?.type !== 'reserved' && entry?.type !== 'released') return false
+    if (
+      entry?.type !== 'reserved'
+      && entry?.type !== 'released'
+      && entry?.type !== 'deducted'
+    ) return false
     const expected = remaining[entry.type]
     if (
       !expected.has(entry.productId)
@@ -264,6 +308,38 @@ function hasCompleteStockLedger(order: OrderDetail): boolean {
     expected.delete(entry.productId)
   }
   return true
+}
+
+// 付款識別及狀態必須與訂單狀態一致；未付款及未發起的訂單沒有付款資料。
+function hasCoherentPayment(order: OrderDetail): boolean {
+  const payment = order.payment
+  if (order.status === 'awaiting_payment' || order.status === 'cancelled' || order.status === 'expired') {
+    return payment === null
+  }
+
+  if (
+    !payment
+    || !isPaymentId(payment.id)
+    || !['pending', 'paid', 'failed'].includes(payment.status)
+    || ![null, 'creation_unconfirmed', 'awaiting_result', 'service_unavailable', 'payment_not_found', 'invalid_response']
+      .includes(payment.pendingReason)
+  ) return false
+
+  if (order.status === 'processing') return payment.status === 'pending'
+  if (order.status === 'paid') return payment.status === 'paid' && payment.pendingReason === null
+  return payment.status === 'failed' && payment.pendingReason === null
+}
+
+// 異常只能列出契約允許的原因與 UTC 時間。
+function hasValidAnomalies(anomalies: unknown): anomalies is PaymentAnomaly[] {
+  const reasons: PaymentAnomaly['reason'][] = [
+    'invalid_response', 'payment_id_mismatch', 'order_id_mismatch',
+    'amount_mismatch', 'currency_mismatch', 'terminal_conflict',
+  ]
+  return Array.isArray(anomalies) && anomalies.every((anomaly) => (
+    reasons.includes(anomaly?.reason)
+    && isUtcTimestamp(anomaly.occurredAt)
+  ))
 }
 
 // 一併檢查明細及歷程結構，避免把不完整的成功回應當成已確認的寫入。
@@ -286,9 +362,24 @@ function isOrderDetail(order: OrderDetail | null | undefined, storeId: number): 
     && order.history.length > 0
     && order.history.every((event) => orderStatuses.includes(event?.status) && isUtcTimestamp(event.occurredAt))
     && hasCompleteStockLedger(order)
-    && order.payment === null
-    && Array.isArray(order.anomalies)
-    && order.anomalies.length === 0
+    && hasCoherentPayment(order)
+    && hasValidAnomalies(order.anomalies)
+  )
+}
+
+// 付款識別固定為 UUID，避免畫面拿不完整或過長值建立後續操作路徑。
+function isPaymentId(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value)
+}
+
+// HQ 清單及決定回應共用欄位驗證，避免接受部分或錯誤綁定資料。
+function isMockPayment(payment: MockPayment | null | undefined): payment is MockPayment {
+  return (
+    isPaymentId(payment?.paymentId)
+    && isPositiveSafeInteger(payment.orderId)
+    && isPositiveSafeInteger(payment.amount)
+    && payment.currency === 'TWD'
+    && ['pending', 'paid', 'failed'].includes(payment.status)
   )
 }
 
@@ -374,5 +465,92 @@ export async function cancelOrder(
     || result.data.id !== id
     || result.data.status !== 'cancelled'
   ) throw new Error('取消回應與所選訂單不符。')
+  return result.data
+}
+
+// 啟動或手動查詢後，只接受同一門市、同一訂單的付款狀態回應。
+async function updatePayment(
+  id: number,
+  storeId: number,
+  action: 'payment' | 'payment/query',
+  csrfToken: string,
+  signal: AbortSignal,
+): Promise<OrderDetail> {
+  const result = await request<{ data: OrderDetail } | null>(`/orders/${id}/${action}`, {
+    method: 'POST',
+    headers: { 'X-CSRF-TOKEN': csrfToken },
+    signal,
+  }, [200])
+
+  if (
+    !isOrderDetail(result?.data, storeId)
+    || result.data.id !== id
+    || !['processing', 'paid', 'failed'].includes(result.data.status)
+  ) throw new Error('付款回應與所選訂單不符。')
+  return result.data
+}
+
+// 付款啟動只由目前使用者明確操作；未知結果交由畫面安全回讀。
+export function startPayment(
+  id: number,
+  storeId: number,
+  csrfToken: string,
+  signal: AbortSignal,
+): Promise<OrderDetail> {
+  return updatePayment(id, storeId, 'payment', csrfToken, signal)
+}
+
+// 手動查詢與通知共用後端結果套用規則，回應仍需核對原訂單。
+export function queryPayment(
+  id: number,
+  storeId: number,
+  csrfToken: string,
+  signal: AbortSignal,
+): Promise<OrderDetail> {
+  return updatePayment(id, storeId, 'payment/query', csrfToken, signal)
+}
+
+// 總部面板只讀取有限頁數，且完整核對回傳的分頁與付款資料。
+export async function getMockPayments(
+  page: number,
+  signal: AbortSignal,
+  perPage = 50,
+): Promise<MockPaymentPage> {
+  if (!isPositiveSafeInteger(page) || !isPositiveSafeInteger(perPage) || perPage > 100) {
+    throw new Error('模擬付款分頁參數不正確。')
+  }
+
+  const result = await request<MockPaymentPage | null>(
+    `/mock-payments?page=${page}&perPage=${perPage}`,
+    { signal },
+  )
+  if (
+    !Array.isArray(result?.data)
+    || result.meta?.page !== page
+    || result.meta.perPage !== perPage
+    || result.meta.perPage > 100
+    || (result.meta.total !== 0 && !isPositiveSafeInteger(result.meta.total))
+    || !result.data.every(isMockPayment)
+  ) throw new Error('模擬付款清單回應不完整。')
+  return result
+}
+
+// 總部只決定待處理付款；終局衝突由後端回報並由畫面回讀。
+export async function decideMockPayment(
+  paymentId: string,
+  status: 'paid' | 'failed',
+  csrfToken: string,
+  signal: AbortSignal,
+): Promise<MockPayment> {
+  if (!isPaymentId(paymentId)) throw new Error('付款識別不正確。')
+  const result = await request<{ data: MockPayment } | null>(`/mock-payments/${paymentId}/decision`, {
+    method: 'POST',
+    body: JSON.stringify({ status }),
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': csrfToken },
+    signal,
+  }, [200])
+  if (!isMockPayment(result?.data) || result.data.paymentId !== paymentId || result.data.status !== status) {
+    throw new Error('模擬付款決定回應不完整。')
+  }
   return result.data
 }

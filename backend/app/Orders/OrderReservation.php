@@ -6,12 +6,17 @@ namespace App\Orders;
 
 use App\Http\Requests\OrderDraft;
 use App\Http\Responses\OrderDetailData;
+use App\Http\Responses\OrderPaymentData;
 use App\Http\Responses\PageData;
+use App\Http\Responses\PaymentAnomalyData;
 use App\Models\User;
+use App\Payments\PaymentData;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use LogicException;
 
 final class OrderReservation
 {
@@ -139,7 +144,129 @@ final class OrderReservation
     // 在門市及訂單鎖下取消，逾期先提交整筆釋放再回報衝突。
     public function cancel(User $actor, int $orderId): OrderDetailData|OrderConflict
     {
-        // 先確認授權並找出不變的所屬門市，避免先持有訂單鎖而反轉鎖定順序。
+        $storeId = $this->authorizedStoreId($actor, $orderId);
+
+        // 先等候門市與訂單鎖，再以資料庫時間判斷截止與當前狀態。
+        return DB::transaction(function () use ($storeId, $orderId): OrderDetailData|OrderConflict {
+            $this->lockStore($storeId);
+            $order = $this->lockOrder($orderId);
+            $this->settleAwaitingOrder($order, cancelBeforeDeadline: true);
+
+            // 既有取消結果可重送；其他狀態統一回報衝突。
+            return $order->status === 'cancelled' ? $this->detail($order) : OrderConflict::State;
+        });
+    }
+
+    // 鎖內決定是否能發起付款；回傳外呼資料前先提交狀態、歷程及建立待辦。
+    public function preparePayment(User $actor, int $orderId, bool $start): PaymentData|OrderDetailData|OrderConflict
+    {
+        $storeId = $this->authorizedStoreId($actor, $orderId);
+
+        // 與取消及到期使用相同鎖序；逾時的發起請求仍須提交整筆到期釋放。
+        return DB::transaction(function () use ($storeId, $orderId, $start): PaymentData|OrderDetailData|OrderConflict {
+            $this->lockStore($storeId);
+            $order = $this->lockOrder($orderId);
+            if ($start && $order->status === 'awaiting_payment') {
+                $now = $this->databaseNow();
+                $this->settleAwaitingOrder($order, cancelBeforeDeadline: false, now: $now);
+                if ($order->status === 'awaiting_payment') {
+                    $this->recordPaymentIntent($order, $now);
+                }
+            }
+
+            // 未曾發起的訂單不能查詢；終局或已確認建立時，重送啟動直接回既有結果。
+            if (!in_array($order->status, ['processing', 'paid', 'failed'], true)) {
+                return OrderConflict::State;
+            }
+            $intent = DB::table('payment_intents')->where('order_id', $orderId)->firstOrFail();
+            if ($start && ($order->status !== 'processing' || !$intent->create_pending)) {
+                return $this->detail($order);
+            }
+
+            return PaymentData::fromRow($intent, $order->status === 'processing' ? 'pending' : $order->status);
+        });
+    }
+
+    // 查詢與未來通知的結果套用集中於同一交易，避免終局反轉及重複扣除或釋放。
+    public function applyPaymentObservation(
+        User $actor,
+        int $orderId,
+        ?PaymentData $observed,
+        ?string $pendingReason,
+    ): OrderDetailData {
+        $storeId = $this->authorizedStoreId($actor, $orderId);
+
+        // 外呼已結束；重新鎖定本機狀態，決定晚到的結果是否仍能套用。
+        return DB::transaction(function () use ($storeId, $orderId, $observed, $pendingReason): OrderDetailData {
+            $this->lockStore($storeId);
+            $order = $this->lockOrder($orderId);
+            $intents = DB::table('payment_intents')->where('order_id', $orderId);
+            $intent = $intents->firstOrFail();
+            $processing = $order->status === 'processing';
+            $anomaly = match (true) {
+                $observed === null => $pendingReason === 'invalid_response' ? $pendingReason : null,
+                $observed->paymentId !== $intent->payment_id => 'payment_id_mismatch',
+                $observed->orderId !== $orderId => 'order_id_mismatch',
+                $observed->amount !== (int) $intent->amount => 'amount_mismatch',
+                $observed->currency !== $intent->currency => 'currency_mismatch',
+                !$processing && !in_array($observed->status, ['pending', $order->status], true) => 'terminal_conflict',
+                default => null,
+            };
+
+            // 異常只追加可讀原因；未知結果不清除建立待辦或原本的保留。
+            if ($anomaly !== null) {
+                DB::table('payment_anomalies')->insert([
+                    'order_id' => $orderId,
+                    'reason' => $anomaly,
+                    'occurred_at' => $this->sqlTime($this->databaseNow()),
+                ]);
+            }
+            if (!$processing) {
+                return $this->detail($order);
+            }
+            if ($observed === null || $anomaly !== null) {
+                $intents->update(['pending_reason' => $anomaly !== null ? 'invalid_response' : $pendingReason]);
+
+                return $this->detail($order);
+            }
+
+            // 綁定正確才能確認遠端存在；只有終局會改變庫存與訂單狀態。
+            $pending = $observed->status === 'pending';
+            $intents->update(['create_pending' => false, 'pending_reason' => $pending ? 'awaiting_result' : null]);
+            if (!$pending) {
+                $now = $this->databaseNow();
+                if ($observed->status === 'paid') {
+                    $this->deductStock($order, $now);
+                }
+                $this->release(DB::table('orders')->where('id', $orderId), $observed->status, $now);
+                $order->status = $observed->status;
+            }
+
+            return $this->detail($order);
+        });
+    }
+
+    // 以開單快照綁定唯一付款；初始待辦和 processing 歷程與意圖必須一起提交。
+    private function recordPaymentIntent(object $order, CarbonImmutable $now): void
+    {
+        DB::table('payment_intents')->insert([
+            'order_id' => $order->id,
+            'payment_id' => (string) Str::uuid(),
+            'amount' => $order->total,
+            'currency' => 'TWD',
+            'create_pending' => true,
+            'pending_reason' => 'creation_unconfirmed',
+        ]);
+        DB::table('orders')->where('id', $order->id)->update(['status' => 'processing']);
+        DB::table('order_history')->insert([
+            'order_id' => $order->id, 'status' => 'processing', 'occurred_at' => $this->sqlTime($now),
+        ]);
+        $order->status = 'processing';
+    }
+
+    // 先授權並查得不變的門市歸屬，讓寫入端可在訂單鎖之前取得門市鎖。
+    private function authorizedStoreId(User $actor, int $orderId): int
+    {
         $storeId = $actor
             ->restrictStores(DB::table('orders'), 'store_id')
             ->where('id', $orderId)
@@ -148,15 +275,7 @@ final class OrderReservation
             abort(404);
         }
 
-        // 先等候門市與訂單鎖，再以資料庫時間判斷截止與當前狀態。
-        return DB::transaction(function () use ($storeId, $orderId): OrderDetailData|OrderConflict {
-            $this->lockStore((int) $storeId);
-            $order = $this->lockOrder($orderId);
-            $this->settleAwaitingOrder($order, cancelBeforeDeadline: true);
-
-            // 既有取消結果可重送；其他狀態統一回報衝突。
-            return $order->status === 'cancelled' ? $this->detail($order) : OrderConflict::State;
-        });
+        return (int) $storeId;
     }
 
     // 排程僅找出目前有到期候選單的門市，各店獨立鎖定及提交。
@@ -193,15 +312,18 @@ final class OrderReservation
         return $order;
     }
 
-    // 取消與重送共用單筆釋放流程；期限前只有取消請求可釋放。
-    private function settleAwaitingOrder(object $order, bool $cancelBeforeDeadline): void
-    {
+    // 取消、重送及付款共用單筆到期流程；期限前只有取消請求可釋放。
+    private function settleAwaitingOrder(
+        object $order,
+        bool $cancelBeforeDeadline,
+        ?CarbonImmutable $now = null,
+    ): void {
         if ($order->status !== 'awaiting_payment') {
             return;
         }
 
         // 等到門市及訂單鎖都取得後，才比較資料庫時間與訂單期限。
-        $now = $this->databaseNow();
+        $now ??= $this->databaseNow();
         $expired = CarbonImmutable::parse($order->expires_at) <= $now;
         if (!$expired && !$cancelBeforeDeadline) {
             return;
@@ -232,7 +354,43 @@ final class OrderReservation
             ->orderBy('id')
             ->get(['product_id', 'quantity', 'type', 'occurred_at']);
 
-        return OrderDetailData::fromRows($row, $items, $history, $ledger);
+        // 付款狀態以訂單為準，與同一交易提交的異常、歷程及庫存一致。
+        $intent = DB::table('payment_intents')->where('order_id', $row->id)->first();
+        $payment = $intent === null ? null : new OrderPaymentData(
+            $intent->payment_id,
+            $row->status === 'processing' ? 'pending' : $row->status,
+            $intent->pending_reason,
+        );
+        $anomalies = DB::table('payment_anomalies')
+            ->where('order_id', $row->id)
+            ->orderBy('id')
+            ->get(['reason', 'occurred_at'])
+            // 對外隱藏原始金流內容，只回傳異常原因及時間。
+            ->map(PaymentAnomalyData::fromRow(...))
+            ->all();
+
+        return OrderDetailData::fromRows($row, $items, $history, $ledger, $payment, $anomalies);
+    }
+
+    // 在門市鎖下以快照一次扣除所有品項，任一庫存缺列或不足都回滾整筆終局。
+    private function deductStock(object $order, CarbonImmutable $now): void
+    {
+        // 只有實際更新的庫存列能產生扣除歷程；訂單的保留稍後隨終局一起釋放。
+        $deducted = DB::affectingStatement(
+            "WITH deducted AS (
+                UPDATE store_inventory AS stock SET on_hand = stock.on_hand - items.quantity
+                FROM order_items AS items
+                WHERE items.order_id = ? AND stock.store_id = ? AND stock.product_id = items.product_id
+                RETURNING items.order_id, items.product_id, items.quantity
+            )
+            INSERT INTO stock_ledger (order_id, product_id, quantity, type, occurred_at)
+            SELECT order_id, product_id, quantity, 'deducted', ? FROM deducted ORDER BY product_id",
+            [$order->id, $order->store_id, $this->sqlTime($now)],
+        );
+        $items = DB::table('order_items')->where('order_id', $order->id)->count();
+        if ($deducted !== $items) {
+            throw new LogicException('Payment stock deduction did not cover every order item.');
+        }
     }
 
     // 保留量以訂單當前狀態為唯一依據，避免另存累計值後不同步。
