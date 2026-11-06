@@ -23,15 +23,19 @@ $mockPayment = getenv('STORE_ORDERING_SERVICE') === 'mock-payment';
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
         web: $mockPayment ? null : __DIR__ . '/../routes/web.php',
-        api: $mockPayment ? __DIR__ . '/../routes/mock-payment.php' : null,
+        api: $mockPayment ? __DIR__ . '/../routes/mock-payment.php' : __DIR__ . '/../routes/payment-notifications.php',
         health: '/up',
     )
-    // 只有訂單服務每分鐘清理到期訂單及補辦付款；兩項作業使用本機訂單資料。
+    // 每個排程器只執行自己的資料庫工作，跨服務結果透過 HTTP 傳送。
     ->withSchedule(function (Schedule $schedule) use ($mockPayment): void {
-        if (!$mockPayment) {
-            $schedule->command('store-ordering:expire-orders')->everyMinute();
-            $schedule->command('store-ordering:recover-payments')->everyMinute();
+        if ($mockPayment) {
+            $schedule->command('store-ordering:dispatch-payment-notification')->everySecond();
+            return;
         }
+
+        // 訂單服務保留原有的到期與付款建立復原頻率。
+        $schedule->command('store-ordering:expire-orders')->everyMinute();
+        $schedule->command('store-ordering:recover-payments')->everyMinute();
     })
     // 讓 API 沿用 web session，並於授權前檢查會話期限。
     ->withMiddleware(function (Middleware $middleware): void {

@@ -272,13 +272,38 @@ final class OrderReservation
         });
     }
 
+    /**
+     * 通知收件交易內，先用付款識別找出可信的訂單，再沿用人工查詢的門市及訂單鎖序。
+     *
+     * @return array{?int, ?string} 本機訂單識別及不接受通知的原因。
+     */
+    public function applyPaymentNotification(PaymentData $observed): array
+    {
+        // 只讀既有綁定，不先鎖付款列，也不因錯誤的訂單識別觸及另一張單。
+        $binding = DB::table('payment_intents')
+            ->join('orders', 'orders.id', '=', 'payment_intents.order_id')
+            ->where('payment_intents.payment_id', $observed->paymentId)
+            ->first(['orders.id', 'orders.store_id']);
+        if ($binding === null) {
+            return [null, 'payment_id_mismatch'];
+        }
+
+        // 取得既有交易鎖後才判斷終局；錯誤通知不更新待確認原因。
+        $orderId = (int) $binding->id;
+        $this->lockStore((int) $binding->store_id);
+        $anomaly = $this->applyObservedPayment($this->lockOrder($orderId), $observed, null, notification: true);
+
+        return [$orderId, $anomaly];
+    }
+
     // 呼叫端持有門市及訂單鎖；集中檢查綁定與終局，避免重複扣除或釋放。
     private function applyObservedPayment(
         object $order,
         ?PaymentData $observed,
         ?string $pendingReason,
         ?int $recoveryAttempt = null,
-    ): void {
+        bool $notification = false,
+    ): ?string {
         // 核對已保存的不可變付款綁定，遠端回應不能替換訂單或金額。
         $orderId = (int) $order->id;
         $intents = DB::table('payment_intents')->where('order_id', $orderId);
@@ -294,7 +319,10 @@ final class OrderReservation
             default => null,
         };
 
-        // 晚到的異常仍須追加可讀原因，但不改變已確認終局。
+        // 通知由收件交易記錄異常及對應的事件識別；其他觀察保留原本的處理。
+        if ($notification && $anomaly !== null) {
+            return $anomaly;
+        }
         if ($anomaly !== null) {
             DB::table('payment_anomalies')->insert([
                 'order_id' => $orderId,
@@ -303,7 +331,7 @@ final class OrderReservation
             ]);
         }
         if (!$processing) {
-            return;
+            return $anomaly;
         }
 
         // 背景未知結果只能更新自己仍有效的待辦，避免蓋過已確認建立或較新嘗試。
@@ -313,7 +341,7 @@ final class OrderReservation
             }
             $intents->update(['pending_reason' => $anomaly !== null ? 'invalid_response' : $pendingReason]);
 
-            return;
+            return $anomaly;
         }
 
         // 綁定正確才確認遠端存在並清空下次可領取時間，已用額度仍保留。
@@ -333,6 +361,8 @@ final class OrderReservation
             $this->release(DB::table('orders')->where('id', $orderId), $observed->status, $now);
             $order->status = $observed->status;
         }
+
+        return null;
     }
 
     // 以開單快照綁定唯一付款；初始待辦和 processing 歷程與意圖必須一起提交。

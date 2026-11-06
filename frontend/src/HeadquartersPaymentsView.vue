@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, shallowRef, useTemplateRef } from 'vue'
-import { ApiError, decideMockPayment, getMockPayments, type MockPayment, type MockPaymentPage } from './api'
+import {
+  ApiError,
+  decideMockPayment,
+  dispatchMockPayment,
+  getMockPayments,
+  type MockPayment,
+  type MockPaymentPage,
+  type PaymentDispatchMode,
+} from './api'
 
 const props = defineProps<{ csrfToken: string }>()
 const emit = defineEmits<{ sessionExpired: [] }>()
@@ -12,6 +20,7 @@ const payments = shallowRef<MockPaymentPage | null>(null)
 const loading = ref(false)
 const loadError = ref('')
 const actionPaymentId = ref<string | null>(null)
+const actionMode = ref<PaymentDispatchMode | null>(null)
 const feedback = ref('')
 const feedbackElement = useTemplateRef<HTMLParagraphElement>('feedbackElement')
 const pendingReadback = shallowRef<{ paymentId: string; status: 'paid' | 'failed' } | null>(null)
@@ -128,6 +137,46 @@ async function decide(payment: MockPayment, status: 'paid' | 'failed'): Promise<
   }
 }
 
+// 終局付款可明確排入原通知事件；不明回應不自動重送。
+async function dispatch(payment: MockPayment, mode: PaymentDispatchMode): Promise<void> {
+  if (busy.value || payment.status === 'pending') return
+  actionPaymentId.value = payment.paymentId
+  actionMode.value = mode
+  feedback.value = ''
+  try {
+    // 只有通過 202 與事件識別核對後，才回報工作已排入佇列。
+    const result = await dispatchMockPayment(payment.paymentId, mode, props.csrfToken, lifetime.signal)
+    if (lifetime.signal.aborted) return
+    feedback.value = mode === 'immediate'
+      ? `通知事件 ${result.eventId} 已排入立即派送佇列。`
+      : `通知事件 ${result.eventId} 已排入 60 秒後派送佇列。`
+  } catch (error) {
+    // 只有明確拒絕可確認未排入；其他失敗保留可能已寫入的未知結果。
+    if (lifetime.signal.aborted) return
+    if (needsSession(error)) {
+      emit('sessionExpired')
+      return
+    }
+    if (error instanceof ApiError && error.status === 404) {
+      feedback.value = '找不到付款或通知事件，請重新載入付款清單。'
+    } else if (error instanceof ApiError && error.status === 409) {
+      feedback.value = '付款或通知事件狀態已變更，請重新載入付款清單。'
+    } else if (error instanceof ApiError && error.status < 500) {
+      feedback.value = '通知派送未排入，請確認付款狀態後再操作。'
+    } else {
+      feedback.value = '通知派送結果尚未確認，可能已排入佇列。請確認目前付款狀態後，再手動重送。'
+    }
+  } finally {
+    actionPaymentId.value = null
+    actionMode.value = null
+  }
+  // 以畫面回饋接收焦點，讓鍵盤使用者也能得知派送結果。
+  if (!lifetime.signal.aborted) {
+    await nextTick()
+    feedbackElement.value?.focus()
+  }
+}
+
 // 換頁沿用同一讀取入口，讓舊頁結果不能覆蓋新頁。
 function changePage(nextPage: number): void {
   if (busy.value || loading.value || nextPage < 1 || nextPage > lastPage.value) return
@@ -152,7 +201,7 @@ void readPage()
       <button class="secondary" type="button" :disabled="loading || busy" @click="readPage()">重新載入付款</button>
     </div>
     <p v-if="feedback" ref="feedbackElement" tabindex="-1" role="status">{{ feedback }}</p>
-    <p v-if="busy" role="status">正在決定模擬付款…</p>
+    <p v-if="busy" role="status">{{ actionMode ? '正在排入通知派送…' : '正在決定模擬付款…' }}</p>
     <div v-if="loadError" class="retry">
       <p role="alert">{{ loadError }}</p>
       <button type="button" :disabled="busy" @click="readPage()">重試</button>
@@ -189,7 +238,19 @@ void readPage()
                 @click="decide(payment, 'failed')"
               >{{ actionPaymentId === payment.paymentId ? '決定中…' : '決定失敗' }}</button>
             </div>
-            <span v-else>已完成</span>
+            <div v-else class="order-actions">
+              <button
+                type="button"
+                :disabled="busy || loading"
+                @click="dispatch(payment, 'immediate')"
+              >{{ actionPaymentId === payment.paymentId && actionMode === 'immediate' ? '排入中…' : '立即送出／重送' }}</button>
+              <button
+                class="secondary"
+                type="button"
+                :disabled="busy || loading"
+                @click="dispatch(payment, 'delayed')"
+              >{{ actionPaymentId === payment.paymentId && actionMode === 'delayed' ? '排入中…' : '延遲 60 秒送出' }}</button>
+            </div>
           </td>
         </tr>
       </tbody>

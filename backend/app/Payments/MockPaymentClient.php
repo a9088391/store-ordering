@@ -38,6 +38,12 @@ final class MockPaymentClient
         return $this->request('POST', "/api/payments/$paymentId/decision", ['json' => ['status' => $status]]);
     }
 
+    // 由模擬服務持久化派送請求，總部的回覆只代表排入待辦。
+    public function dispatch(string $paymentId, string $mode): ?Response
+    {
+        return $this->request('POST', "/api/payments/$paymentId/dispatch", ['json' => ['mode' => $mode]]);
+    }
+
     // 每個外呼各自限時三秒，保留 HTTP 狀態供呼叫端區分 404、衝突及未知結果。
     private function request(string $method, string $path, array $options = []): ?Response
     {

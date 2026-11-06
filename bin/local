@@ -45,15 +45,19 @@ esac
 
 # 讓私密值一律來自本模式的檔案，避免 Compose 優先套用外部 shell 的同名變數。
 unset STORE_ORDERING_APP_KEY STORE_ORDERING_DB_PASSWORD STORE_ORDERING_POSTGRES_PASSWORD
-unset STORE_ORDERING_MOCK_PAYMENT_DB_PASSWORD
+unset STORE_ORDERING_MOCK_PAYMENT_DB_PASSWORD STORE_ORDERING_PAYMENT_HMAC_KEY
 compose=(docker compose -f compose.yaml -p "$project" --env-file "$local_dir/runtime.env")
 mock_env="$local_dir/mock-payment.env"
-if [ -L "$mock_env" ]; then
-    printf '拒絕以符號連結存放模擬金流設定。\n' >&2
+notification_env="$local_dir/payment-notifications.env"
+if [ -L "$mock_env" ] || [ -L "$notification_env" ]; then
+    printf '拒絕以符號連結存放模擬金流或通知設定。\n' >&2
     exit 1
 fi
 if [ -f "$mock_env" ]; then
     compose+=(--env-file "$mock_env")
+fi
+if [ -f "$notification_env" ]; then
+    compose+=(--env-file "$notification_env")
 fi
 
 # 原子建立權限為 0600 的檔案，重跑時沿用既有值，避免密鑰或密碼中途被覆寫。
@@ -155,14 +159,33 @@ prepare_mock_password() {
     chmod 600 "$mock_env"
 }
 
+# 舊環境獨立補建通知金鑰，不覆寫任何既有資料庫密碼或應用程式密鑰。
+prepare_notification_key() {
+    local key setting
+    if [ ! -f "$notification_env" ]; then
+        key="$(openssl rand -hex 32)"
+        write_private_file "$notification_env" "STORE_ORDERING_PAYMENT_HMAC_KEY=$key"
+        compose+=(--env-file "$notification_env")
+    fi
+
+    # 僅在金鑰完整且可限制存取時啟動，錯誤訊息不顯示內容。
+    setting="$(<"$notification_env")"
+    if [[ ! "$setting" =~ ^STORE_ORDERING_PAYMENT_HMAC_KEY=[0-9a-f]{64}$ ]]; then
+        printf '通知金鑰設定格式不正確，請先檢查 %s。\n' "$notification_env" >&2
+        return 1
+    fi
+    chmod 600 "$notification_env"
+}
+
 case "$command" in
     up)
-        # 資料庫就緒並完成遷移與冪等初始化後，才啟動網站與到期排程。
+        # 資料庫完成遷移與冪等初始化後，才啟動網站與兩個排程器。
         docker info --format "{{.ServerVersion}}" >/dev/null
         prepare_runtime
         prepare_accounts
+        prepare_notification_key
         "${compose[@]}" build app
-        "${compose[@]}" stop app scheduler mock-payment
+        "${compose[@]}" stop mock-payment-scheduler app scheduler mock-payment
         prepare_mock_password
         "${compose[@]}" up -d --wait db
         # 每次 up 都核對並補齊本案資料庫資源，避免首次中斷留下半套環境。
@@ -174,7 +197,7 @@ case "$command" in
         "${compose[@]}" run --rm -T --no-deps --user root \
             -v "$PWD/$local_dir/accounts.json:/setup/accounts.json:ro" \
             app php artisan store-ordering:seed-demo /setup/accounts.json
-        "${compose[@]}" up -d --wait --no-build --pull never app scheduler mock-payment
+        "${compose[@]}" up -d --wait --no-build --pull never app scheduler mock-payment mock-payment-scheduler
         printf '網站 http://127.0.0.1:%s，初始帳密 %s/accounts.json\n' \
             "$STORE_ORDERING_PORT" "$local_dir"
         ;;

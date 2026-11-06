@@ -87,6 +87,7 @@ const anomalyLabels: Record<PaymentAnomaly['reason'], string> = {
   amount_mismatch: '付款金額不符',
   currency_mismatch: '付款幣別不符',
   terminal_conflict: '付款終局狀態衝突',
+  event_content_conflict: '付款通知事件內容衝突',
 }
 const numberFormat = new Intl.NumberFormat('zh-TW')
 const dateFormat = new Intl.DateTimeFormat('zh-TW', {

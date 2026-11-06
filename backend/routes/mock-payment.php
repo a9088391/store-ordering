@@ -10,3 +10,4 @@ Route::get('/payments', [MockPaymentController::class, 'index']);
 Route::post('/payments', [MockPaymentController::class, 'create']);
 Route::get('/payments/{paymentId}', [MockPaymentController::class, 'show'])->whereUuid('paymentId');
 Route::post('/payments/{paymentId}/decision', [MockPaymentController::class, 'decide'])->whereUuid('paymentId');
+Route::post('/payments/{paymentId}/dispatch', [MockPaymentController::class, 'dispatch'])->whereUuid('paymentId');

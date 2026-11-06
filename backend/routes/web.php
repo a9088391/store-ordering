@@ -38,5 +38,7 @@ Route::prefix('api')
             Route::get('/mock-payments', [HeadquartersPaymentController::class, 'index']);
             Route::post('/mock-payments/{paymentId}/decision', [HeadquartersPaymentController::class, 'decide'])
                 ->whereUuid('paymentId');
+            Route::post('/mock-payments/{paymentId}/dispatch', [HeadquartersPaymentController::class, 'dispatch'])
+                ->whereUuid('paymentId');
         });
     });

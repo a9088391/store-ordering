@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace App\Http\Controllers;
 
 use App\Http\Requests\PaymentDecision;
+use App\Http\Requests\PaymentDispatchMode;
 use App\Http\Responses\PageData;
+use App\Payments\MockPaymentNotifications;
 use App\Payments\PaymentData;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -45,7 +47,8 @@ final class MockPaymentController
             'currency' => $payment->currency,
             'status' => 'pending',
         ]);
-        $stored = $this->payment($paymentId);
+        $row = $this->paymentRow($paymentId);
+        $stored = PaymentData::fromRow($row, $row->status);
         if (
             $stored->orderId !== $payment->orderId
             || $stored->amount !== $payment->amount
@@ -60,32 +63,62 @@ final class MockPaymentController
     // 查詢只回傳既有付款，查無識別不會自動建立。
     public function show(string $paymentId): JsonResponse
     {
-        return response()->json(['data' => $this->payment(strtolower($paymentId))]);
+        $row = $this->paymentRow(strtolower($paymentId));
+
+        return response()->json(['data' => PaymentData::fromRow($row, $row->status)]);
     }
 
-    // PostgreSQL 只允許 pending 的列轉移；相反決定即使同時抵達也無法覆寫。
-    public function decide(Request $request, string $paymentId): JsonResponse
+    // 決定與不可變事件一起提交，使用同一付款列鎖協調派送及相反終局。
+    public function decide(Request $request, string $paymentId, MockPaymentNotifications $notifications): JsonResponse
     {
         $decision = PaymentDecision::fromRequest($request);
         $paymentId = strtolower($paymentId);
-        DB::table('payments')
-            ->where('payment_id', $paymentId)
-            ->where('status', 'pending')
-            ->update(['status' => $decision->value]);
 
-        // 讀回最終決定，讓相同重試可直接取得已保存結果。
-        $payment = $this->payment($paymentId);
-        abort_if($payment->status !== $decision->value, 409);
+        // 相同結果的重試取得原事件，早期版本的終局付款在此補建事件。
+        $payment = DB::transaction(function () use ($paymentId, $decision, $notifications): PaymentData {
+            $row = $this->paymentRow($paymentId, lock: true);
+            if ($row->status === 'pending') {
+                DB::table('payments')->where('payment_id', $paymentId)->update(['status' => $decision->value]);
+            } else {
+                abort_if($row->status !== $decision->value, 409);
+            }
+
+            // 事件建立失敗時回滾新決定；此操作本身不排入派送。
+            $payment = PaymentData::fromRow($row, $decision->value);
+            $notifications->eventId($payment);
+
+            return $payment;
+        });
 
         return response()->json(['data' => $payment]);
     }
 
-    // 單筆操作共用相同的查無資源及 DTO 轉換。
-    private function payment(string $paymentId): PaymentData
+    // 派送不改變結果，舊付款事件補建與新增待辦在同一交易完成。
+    public function dispatch(Request $request, string $paymentId, MockPaymentNotifications $notifications): JsonResponse
     {
-        $row = DB::table('payments')->where('payment_id', $paymentId)->first();
+        $mode = PaymentDispatchMode::fromRequest($request);
+        $paymentId = strtolower($paymentId);
+
+        // 只在終局排入；重送即新增一筆指向同一事件的待辦。
+        $eventId = DB::transaction(function () use ($paymentId, $mode, $notifications): string {
+            $row = $this->paymentRow($paymentId, lock: true);
+            abort_if($row->status === 'pending', 409);
+            $eventId = $notifications->eventId(PaymentData::fromRow($row, $row->status));
+            $notifications->enqueue($eventId, delayed: $mode === PaymentDispatchMode::Delayed);
+
+            return $eventId;
+        });
+
+        return response()->json(['data' => ['eventId' => $eventId, 'mode' => $mode->value]], 202);
+    }
+
+    // 讀取及寫入共用相同的查無資源行為；寫入須先鎖定付款。
+    private function paymentRow(string $paymentId, bool $lock = false): object
+    {
+        $payments = DB::table('payments')->where('payment_id', $paymentId);
+        $row = ($lock ? $payments->lock('FOR NO KEY UPDATE') : $payments)->first();
         abort_if($row === null, 404);
 
-        return PaymentData::fromRow($row, $row->status);
+        return $row;
     }
 }

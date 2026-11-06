@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { chromium } from 'playwright-core'
 
@@ -113,7 +114,7 @@ async function expectOrderLayout(page) {
   }
 }
 
-// 確認 HQ 長付款識別與決定控制在手機及桌機面板內可讀、可操作。
+// 確認 HQ 長付款識別與終局派送控制在手機及桌機面板內可讀、可操作。
 async function expectPaymentPanelLayout(page, paymentId) {
   const panel = page.getByRole('region', { name: '總部模擬付款' })
   for (const width of [320, 1280]) {
@@ -141,6 +142,28 @@ async function expectPaymentPanelLayout(page, paymentId) {
     assert.equal(measured.identifierFits, true)
     assert.equal(measured.controls.every(({ left, right }) => left >= 0 && right <= width), true)
   }
+}
+
+// 以同一登入會話輪詢唯讀訂單詳情，直到背景通知套用到終局。
+async function waitForOrderStatus(context, orderId, status) {
+  const deadline = Date.now() + 8000
+  let order
+  while (Date.now() < deadline) {
+    // 每次只讀訂單詳情，確認背景通知是否已更新狀態。
+    const response = await context.request.get(`/api/orders/${orderId}`, {
+      headers: { Accept: 'application/json' },
+      maxRedirects: 0,
+    })
+    assert.equal(response.status(), 200)
+    order = (await response.json()).data
+    if (order.status === status) return order
+    // 等待目標處理中的訂單，不接受其他提早終局。
+    assert.equal(order.status, 'processing')
+    // 以短間隔輪詢已提交的背景工作，不以固定延遲推定完成。
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  assert.equal(order?.status, status)
+  return order
 }
 
 // 驗證登出後的登入表單可用，且重載不會再顯示上一位使用者的庫存。
@@ -171,7 +194,9 @@ let committedOrderId
 let trackedOrderKey
 let paymentOrderId
 let replacementOrderId
+let dispatchOrderId
 let paymentId
+let dispatchPaymentId
 let paymentStartPostCount = 0
 let paymentQueryPostCount = 0
 
@@ -564,6 +589,7 @@ try {
   await paymentPanel.getByRole('button', { name: '重新載入付款', exact: true }).click()
   const pendingPaymentRow = paymentPanel.getByRole('row').filter({ hasText: paymentId })
   await pendingPaymentRow.getByText('待決定', { exact: true }).waitFor()
+  assert.deepEqual(await pendingPaymentRow.getByRole('button').allTextContents(), ['決定成功', '決定失敗'])
   await expectPaymentPanelLayout(page, paymentId)
   await page.getByLabel('門市', { exact: true }).selectOption({ label: '台中門市' })
   await expectInventory(page, 4, 0)
@@ -575,7 +601,11 @@ try {
   const decisionFeedback = paymentPanel.getByRole('status').filter({ hasText: '已重新讀取付款狀態：付款失敗。' })
   await decisionFeedback.waitFor()
   assert.equal(await decisionFeedback.evaluate((element) => element === document.activeElement), true)
-  assert.equal(await pendingPaymentRow.getByRole('button').count(), 0)
+  assert.equal(await pendingPaymentRow.getByRole('button', { name: '決定成功', exact: true }).count(), 0)
+  assert.equal(await pendingPaymentRow.getByRole('button', { name: '決定失敗', exact: true }).count(), 0)
+  assert.deepEqual(await pendingPaymentRow.getByRole('button').allTextContents(), [
+    '立即送出／重送', '延遲 60 秒送出',
+  ])
   await expectPaymentPanelLayout(page, paymentId)
 
   // 回到原門市，以單號追蹤同一訂單在清單中的處理中與付款失敗狀態。
@@ -722,10 +752,207 @@ try {
   await expectInventoryBalances(page, 12, 12, 3, 3)
   assert.deepEqual(replacementFeedback, [])
 
+  // 以目前 HQ 會話建立失敗付款，供通知派送驗收使用且不重設共享資料。
+  phase = '驗證總部延遲通知、回應遺失後明確重送'
+  const sessionResponse = await context.request.get('/api/session', {
+    headers: { Accept: 'application/json' },
+    maxRedirects: 0,
+  })
+  assert.equal(sessionResponse.status(), 200)
+  const session = await sessionResponse.json()
+  assert.equal(session.user.role, 'headquarters')
+  const csrfToken = session.csrfToken
+  assert.equal(typeof csrfToken === 'string' && csrfToken.length > 0, true)
+
+  const inventoryResponse = await context.request.get('/api/stores/1/inventory?page=1', {
+    headers: { Accept: 'application/json' },
+    maxRedirects: 0,
+  })
+  assert.equal(inventoryResponse.status(), 200)
+  const inventoryBeforeDispatch = (await inventoryResponse.json()).data
+  const coffee = inventoryBeforeDispatch.find(({ name }) => name === '濾掛咖啡')
+  const cookies = inventoryBeforeDispatch.find(({ name }) => name === '燕麥餅乾')
+  assert.ok(coffee?.available > 0)
+  assert.ok(cookies)
+
+  const createdResponse = await context.request.post('/api/orders', {
+    headers: { Accept: 'application/json', 'X-CSRF-TOKEN': csrfToken },
+    data: {
+      storeId: 1,
+      operationKey: randomUUID(),
+      items: [{ productId: coffee.id, quantity: 1 }],
+    },
+    maxRedirects: 0,
+  })
+  assert.equal(createdResponse.status(), 201)
+  const createdFixture = (await createdResponse.json()).data
+  dispatchOrderId = createdFixture.id
+  assert.equal(createdFixture.status, 'awaiting_payment')
+
+  const startFixtureResponse = await context.request.post(`${origin}/api/orders/${dispatchOrderId}/payment`, {
+    headers: { Accept: 'application/json', 'X-CSRF-TOKEN': csrfToken },
+    maxRedirects: 0,
+  })
+  assert.equal(startFixtureResponse.status(), 200)
+  const startedFixture = (await startFixtureResponse.json()).data
+  assert.equal(startedFixture.status, 'processing')
+  dispatchPaymentId = startedFixture.payment.id
+
+  const decisionFixtureResponse = await context.request.post(
+    `${origin}/api/mock-payments/${dispatchPaymentId}/decision`,
+    {
+      headers: { Accept: 'application/json', 'X-CSRF-TOKEN': csrfToken },
+      data: { status: 'failed' },
+      maxRedirects: 0,
+    },
+  )
+  assert.equal(decisionFixtureResponse.status(), 200)
+  assert.equal((await decisionFixtureResponse.json()).data.status, 'failed')
+
+  const dispatchEndpoint = `${origin}/api/mock-payments/${dispatchPaymentId}/dispatch`
+  const dispatchBodies = []
+  let fixtureQueryCount = 0
+  // 計算派送 POST 以驗證人工重送，並確認付款查詢 POST 未介入通知結算。
+  page.on('request', (request) => {
+    if (request.url() === dispatchEndpoint && request.method() === 'POST') {
+      dispatchBodies.push(JSON.parse(request.postData()))
+    }
+    if (request.url() === `${origin}/api/orders/${dispatchOrderId}/payment/query`) {
+      fixtureQueryCount++
+    }
+  })
+
+  await paymentPanel.getByRole('button', { name: '重新載入付款', exact: true }).click()
+  const dispatchRow = paymentPanel.getByRole('row').filter({ hasText: dispatchPaymentId })
+  await dispatchRow.getByText('付款失敗', { exact: true }).waitFor()
+  assert.deepEqual(await dispatchRow.getByRole('button').allTextContents(), [
+    '立即送出／重送', '延遲 60 秒送出',
+  ])
+  await expectPaymentPanelLayout(page, dispatchPaymentId)
+
+  // 延遲派送需收到真實 202 並明確顯示排入佇列，不宣稱通知已送達。
+  const delayedResponsePromise = page.waitForResponse((response) => (
+    response.url() === dispatchEndpoint && response.request().method() === 'POST'
+  ))
+  const immediateButton = dispatchRow.getByRole('button', { name: '立即送出／重送', exact: true })
+  const delayedButton = dispatchRow.getByRole('button', { name: '延遲 60 秒送出', exact: true })
+  await immediateButton.focus()
+  await page.keyboard.press('Tab')
+  assert.equal(await delayedButton.evaluate((button) => (
+    button === document.activeElement
+      && button.matches(':focus-visible')
+      && getComputedStyle(button).outlineStyle === 'solid'
+  )), true)
+  await page.keyboard.press('Enter')
+  const delayedResponse = await delayedResponsePromise
+  assert.equal(delayedResponse.status(), 202)
+  const delayedDispatch = (await delayedResponse.json()).data
+  assert.match(delayedDispatch.eventId, /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i)
+  assert.equal(delayedDispatch.mode, 'delayed')
+  assert.deepEqual(dispatchBodies, [{ mode: 'delayed' }])
+  const delayedFeedback = paymentPanel.getByRole('status').filter({
+    hasText: `通知事件 ${delayedDispatch.eventId} 已排入 60 秒後派送佇列。`,
+  })
+  await delayedFeedback.waitFor()
+  assert.equal(await delayedFeedback.evaluate((element) => element === document.activeElement), true)
+  const orderAfterDelayResponse = await context.request.get(`/api/orders/${dispatchOrderId}`, {
+    headers: { Accept: 'application/json' },
+    maxRedirects: 0,
+  })
+  assert.equal(orderAfterDelayResponse.status(), 200)
+  assert.equal((await orderAfterDelayResponse.json()).data.status, 'processing')
+
+  // 讓真正成功排入的立即重送遺失瀏覽器回應，確認畫面保留未知狀態且不自動再送。
+  let lostDispatch
+  await page.route(dispatchEndpoint, async (route) => {
+    const response = await route.fetch()
+    assert.equal(response.status(), 202)
+    lostDispatch = await response.json()
+    await route.abort()
+  }, { times: 1 })
+  await immediateButton.focus()
+  await page.keyboard.press('Enter')
+  const unknownDispatchFeedback = paymentPanel.getByRole('status').filter({
+    hasText: '通知派送結果尚未確認，可能已排入佇列。',
+  })
+  await unknownDispatchFeedback.waitFor()
+  assert.equal(await unknownDispatchFeedback.evaluate((element) => element === document.activeElement), true)
+  assert.equal(dispatchBodies.length, 2)
+  assert.equal(dispatchBodies[1].mode, 'immediate')
+  assert.equal(lostDispatch.data.mode, 'immediate')
+  assert.equal(lostDispatch.data.eventId, delayedDispatch.eventId)
+  assert.equal(fixtureQueryCount, 0)
+
+  // 只有再按一次立即重送後才送第二次該操作，回應仍須指向原事件。
+  const immediateResponsePromise = page.waitForResponse((response) => (
+    response.url() === dispatchEndpoint && response.request().method() === 'POST'
+  ))
+  await immediateButton.focus()
+  await page.keyboard.press('Enter')
+  const immediateResponse = await immediateResponsePromise
+  assert.equal(immediateResponse.status(), 202)
+  const immediateDispatch = (await immediateResponse.json()).data
+  assert.equal(immediateDispatch.mode, 'immediate')
+  assert.equal(immediateDispatch.eventId, delayedDispatch.eventId)
+  assert.deepEqual(dispatchBodies, [
+    { mode: 'delayed' }, { mode: 'immediate' }, { mode: 'immediate' },
+  ])
+  const immediateFeedback = paymentPanel.getByRole('status').filter({
+    hasText: `通知事件 ${delayedDispatch.eventId} 已排入立即派送佇列。`,
+  })
+  await immediateFeedback.waitFor()
+  assert.equal(await immediateFeedback.evaluate((element) => element === document.activeElement), true)
+
+  const dispatchedOrder = await waitForOrderStatus(context, dispatchOrderId, 'failed')
+  assert.equal(dispatchedOrder.payment.id, dispatchPaymentId)
+  assert.equal(dispatchedOrder.payment.status, 'failed')
+  assert.equal(dispatchedOrder.history.filter(({ status }) => status === 'failed').length, 1)
+  assert.equal(dispatchedOrder.stockLedger.filter(({ type }) => type === 'reserved').length, 1)
+  assert.equal(dispatchedOrder.stockLedger.filter(({ type }) => type === 'released').length, 1)
+  assert.equal(dispatchedOrder.stockLedger.filter(({ type }) => type === 'deducted').length, 0)
+  assert.equal(fixtureQueryCount, 0)
+
+  // 用畫面實際切店重讀庫存，再從訂單篩選、開啟同一失敗訂單詳情。
+  const storePicker = page.getByLabel('門市', { exact: true })
+  await storePicker.selectOption({ label: '台中門市' })
+  await expectInventory(page, 4, 0)
+  await storePicker.selectOption({ label: '台北門市' })
+  await expectInventoryBalances(page, coffee.onHand, coffee.available, cookies.onHand, cookies.available)
+  await page.getByLabel('訂單編號', { exact: true }).fill(String(dispatchOrderId))
+  await page.getByLabel('訂單狀態', { exact: true }).selectOption('failed')
+  await page.getByLabel('建立起日（含）', { exact: true }).fill('')
+  await page.getByLabel('建立迄日（不含）', { exact: true }).fill('')
+  await page.getByRole('button', { name: '套用篩選', exact: true }).click()
+  const dispatchOrderList = page.getByRole('list', { name: '訂單查詢結果' })
+  const dispatchOrderButton = dispatchOrderList.getByRole('button', {
+    name: `查看訂單 #${dispatchOrderId}`,
+    exact: true,
+  })
+  await dispatchOrderButton.waitFor()
+  await dispatchOrderButton.click()
+  const dispatchOrderDetail = page.getByRole('region', { name: `訂單 #${dispatchOrderId}` })
+  await dispatchOrderDetail.getByText(dispatchPaymentId, { exact: true }).waitFor()
+  assert.equal(await dispatchOrderDetail.locator('dl.order-summary dd').getByText('付款失敗', { exact: true }).count(), 2)
+  assert.deepEqual(
+    (await dispatchOrderDetail.locator('ol').nth(1).locator('li').allTextContents())
+      .map((text) => text.replace(/\s+/g, ' ').trim().split(' · ')[0]),
+    ['保留 濾掛咖啡 × 1', '釋放 濾掛咖啡 × 1'],
+  )
+  assert.equal(fixtureQueryCount, 0)
+
+  const inventoryAfterDispatchResponse = await context.request.get('/api/stores/1/inventory?page=1', {
+    headers: { Accept: 'application/json' },
+    maxRedirects: 0,
+  })
+  assert.equal(inventoryAfterDispatchResponse.status(), 200)
+  const coffeeAfterDispatch = (await inventoryAfterDispatchResponse.json()).data
+    .find(({ id }) => id === coffee.id)
+  assert.equal(coffeeAfterDispatch.available, coffee.available)
+
   // 確認主要流程沒有未捕捉的頁面例外。
   phase = '確認頁面執行狀態'
   assert.deepEqual(pageErrors, [])
-  console.log('PASS：登入、登出、重載、總部及兩店庫存、訂單重送／付款／查詢／取消、焦點與手機版面。')
+  console.log('PASS：登入、登出、重載、總部與兩店庫存、訂單／付款查詢、通知延遲及重送、焦點與 320/1280 手機／桌機版面。')
 } catch (error) {
   // Playwright 的動作紀錄可能包含欄位值及 API 會話標頭，輸出前先遮蔽。
   let diagnostic = error instanceof Error ? error.message : '未知錯誤'
@@ -735,7 +962,7 @@ try {
     diagnostic = diagnostic.replaceAll(secret, '[已遮蔽]').replaceAll(escaped, '[已遮蔽]')
   }
   console.error(`FAIL：${phase}\n${diagnostic}`)
-  console.error('已知測試訂單編號', { committedOrderId, paymentOrderId, replacementOrderId })
+  console.error('已知測試訂單編號', { committedOrderId, paymentOrderId, replacementOrderId, dispatchOrderId })
   process.exitCode = 1
 } finally {
   await browser?.close()

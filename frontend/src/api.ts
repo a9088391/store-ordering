@@ -93,6 +93,7 @@ export interface PaymentAnomaly {
     | 'amount_mismatch'
     | 'currency_mismatch'
     | 'terminal_conflict'
+    | 'event_content_conflict'
   occurredAt: string
 }
 
@@ -107,6 +108,13 @@ export interface MockPayment {
 export interface MockPaymentPage {
   data: MockPayment[]
   meta: InventoryPage['meta']
+}
+
+export type PaymentDispatchMode = 'immediate' | 'delayed'
+
+export interface PaymentDispatch {
+  eventId: string
+  mode: PaymentDispatchMode
 }
 
 export interface OrderDetail extends OrderSummary {
@@ -322,7 +330,7 @@ function hasCoherentPayment(order: OrderDetail): boolean {
 
   if (
     !payment
-    || !isPaymentId(payment.id)
+    || !isUuid(payment.id)
     || !['pending', 'paid', 'failed'].includes(payment.status)
     || !pendingPaymentReasons.includes(payment.pendingReason)
   ) return false
@@ -336,7 +344,7 @@ function hasCoherentPayment(order: OrderDetail): boolean {
 function hasValidAnomalies(anomalies: unknown): anomalies is PaymentAnomaly[] {
   const reasons: PaymentAnomaly['reason'][] = [
     'invalid_response', 'payment_id_mismatch', 'order_id_mismatch',
-    'amount_mismatch', 'currency_mismatch', 'terminal_conflict',
+    'amount_mismatch', 'currency_mismatch', 'terminal_conflict', 'event_content_conflict',
   ]
   return Array.isArray(anomalies) && anomalies.every((anomaly) => (
     reasons.includes(anomaly?.reason)
@@ -369,15 +377,15 @@ function isOrderDetail(order: OrderDetail | null | undefined, storeId: number): 
   )
 }
 
-// 付款識別固定為 UUID，避免畫面拿不完整或過長值建立後續操作路徑。
-function isPaymentId(value: unknown): value is string {
+// 付款與事件識別固定為 UUID，避免用不完整或過長值建立操作路徑。
+function isUuid(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value)
 }
 
 // HQ 清單及決定回應共用欄位驗證，避免接受部分或錯誤綁定資料。
 function isMockPayment(payment: MockPayment | null | undefined): payment is MockPayment {
   return (
-    isPaymentId(payment?.paymentId)
+    isUuid(payment?.paymentId)
     && isPositiveSafeInteger(payment.orderId)
     && isPositiveSafeInteger(payment.amount)
     && payment.currency === 'TWD'
@@ -544,7 +552,7 @@ export async function decideMockPayment(
   csrfToken: string,
   signal: AbortSignal,
 ): Promise<MockPayment> {
-  if (!isPaymentId(paymentId)) throw new Error('付款識別不正確。')
+  if (!isUuid(paymentId)) throw new Error('付款識別不正確。')
   const result = await request<{ data: MockPayment } | null>(`/mock-payments/${paymentId}/decision`, {
     method: 'POST',
     body: JSON.stringify({ status }),
@@ -554,5 +562,28 @@ export async function decideMockPayment(
   if (!isMockPayment(result?.data) || result.data.paymentId !== paymentId || result.data.status !== status) {
     throw new Error('模擬付款決定回應不完整。')
   }
+  return result.data
+}
+
+// 總部只派送已決定付款的既有通知事件，並核對持久化佇列回應。
+export async function dispatchMockPayment(
+  paymentId: string,
+  mode: PaymentDispatchMode,
+  csrfToken: string,
+  signal: AbortSignal,
+): Promise<PaymentDispatch> {
+  if (!isUuid(paymentId)) throw new Error('付款識別不正確。')
+  // 僅接受契約指定的 202，其他成功狀態不能當作已排入。
+  const result = await request<{ data: PaymentDispatch } | null>(`/mock-payments/${paymentId}/dispatch`, {
+    method: 'POST',
+    body: JSON.stringify({ mode }),
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': csrfToken },
+    signal,
+  }, [202])
+  // 事件識別及模式都需對應本次請求，避免把不完整回應報為成功。
+  if (
+    !isUuid(result?.data?.eventId)
+    || result.data.mode !== mode
+  ) throw new Error('通知派送回應不完整。')
   return result.data
 }

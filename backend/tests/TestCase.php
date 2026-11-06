@@ -29,4 +29,16 @@ abstract class TestCase extends BaseTestCase
         // 直接執行 Artisan 初始化測試資料表，沿用真正的 PostgreSQL 遷移流程。
         $this->withoutMockingConsoleOutput();
     }
+
+    // 在隔離測試交易覆寫資料庫牆鐘，回滾後恢復 PostgreSQL 的原始函式及搜尋路徑。
+    protected function setDatabaseClock(string $time): void
+    {
+        DB::statement('CREATE SCHEMA IF NOT EXISTS order_api_clock');
+        DB::unprepared(<<<'SQL'
+            CREATE OR REPLACE FUNCTION order_api_clock.clock_timestamp() RETURNS timestamptz
+            LANGUAGE sql VOLATILE AS $$ SELECT current_setting('store_ordering.test_clock')::timestamptz $$
+            SQL);
+        DB::statement('SET LOCAL search_path TO order_api_clock, pg_catalog, public');
+        DB::scalar("SELECT set_config('store_ordering.test_clock', ?, true)", [$time]);
+    }
 }

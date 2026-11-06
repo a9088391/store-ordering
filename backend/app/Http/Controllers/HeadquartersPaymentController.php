@@ -5,12 +5,14 @@ declare(strict_types=1);
 namespace App\Http\Controllers;
 
 use App\Http\Requests\PaymentDecision;
+use App\Http\Requests\PaymentDispatchMode;
 use App\Http\Responses\MockPaymentPageData;
 use App\Http\Responses\PageData;
 use App\Payments\MockPaymentClient;
 use App\Payments\PaymentData;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Str;
 
 final readonly class HeadquartersPaymentController
 {
@@ -55,5 +57,29 @@ final readonly class HeadquartersPaymentController
         }
 
         return response()->json(['data' => $result]);
+    }
+
+    // 派送維持總部權限及 CSRF，只有可核對的遠端 202 代表已排入待辦。
+    public function dispatch(Request $request, string $paymentId): JsonResponse
+    {
+        abort_unless($request->user()->role === 'headquarters', 403);
+        $mode = PaymentDispatchMode::fromRequest($request)->value;
+        $response = $this->mock->dispatch(strtolower($paymentId), $mode);
+
+        // 未知、狀態衝突和其他服務錯誤由前端分別處理。
+        abort_if($response?->notFound(), 404);
+        abort_if($response?->conflict(), 409);
+        abort_unless($response?->status() === 202, 503);
+        $data = $response->json('data');
+        $eventId = $data['eventId'] ?? null;
+        if (
+            !is_string($eventId)
+            || !Str::isUuid($eventId)
+            || ($data['mode'] ?? null) !== $mode
+        ) {
+            abort(503);
+        }
+
+        return response()->json(['data' => ['eventId' => $eventId, 'mode' => $mode]], 202);
     }
 }

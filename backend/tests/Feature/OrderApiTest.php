@@ -12,11 +12,296 @@ use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Str;
 use Illuminate\Testing\TestResponse;
 use Tests\TestCase;
 
 final class OrderApiTest extends TestCase
 {
+    // 從無登入的通知入口完成交易，再重送同一事件確認歷程及庫存只異動一次。
+    public function testSignedPaymentNotificationSettlesOnceWithoutSession(): void
+    {
+        $this->insertFixture();
+        $binding = $this->startPendingPayment('signed-notification');
+        $orderId = $binding['orderId'];
+        $event = ['eventId' => (string) Str::uuid(), 'status' => 'paid'] + $binding;
+        $body = json_encode($event, JSON_THROW_ON_ERROR);
+
+        // 通知無瀏覽器會話，連送兩次後再透過授權的訂單及庫存端點讀回結果。
+        $this->app['auth']->forgetGuards();
+        $expected = ['data' => ['eventId' => $event['eventId']]];
+        $this->postSignedNotification($body)->assertOk()->assertExactJson($expected)->assertHeaderMissing('Set-Cookie');
+        $this->postSignedNotification($body)->assertOk()->assertExactJson($expected);
+        $this->authenticate(2);
+        $detail = $this
+            ->getJson("/api/orders/$orderId")
+            ->assertOk()
+            ->assertJsonPath('data.payment', [
+                'id' => $binding['paymentId'], 'status' => 'paid', 'pendingReason' => null,
+            ])
+            ->assertJsonCount(0, 'data.anomalies');
+        self::assertSame(
+            ['awaiting_payment', 'processing', 'paid'],
+            array_column($detail->json('data.history'), 'status'),
+        );
+        self::assertSame(['reserved', 'deducted', 'released'], array_column($detail->json('data.stockLedger'), 'type'));
+        $this
+            ->getJson('/api/stores/1/inventory')
+            ->assertOk()
+            ->assertJsonPath('data.0.onHand', 10)
+            ->assertJsonPath('data.0.available', 10);
+    }
+
+    // 驗簽優先於 JSON 驗證；有簽章但格式或數值不合法的通知也不能更改付款。
+    public function testNotificationsRejectInvalidAuthenticationAndFieldsWithoutBusinessEffects(): void
+    {
+        $this->insertFixture();
+        $binding = $this->startPendingPayment('notification-invalid');
+        $event = ['eventId' => (string) Str::uuid(), 'status' => 'paid'] + $binding;
+        $body = json_encode($event, JSON_THROW_ON_ERROR);
+        $orderId = $binding['orderId'];
+        $before = $this->getJson("/api/orders/$orderId")->assertOk()->json();
+        $time = now()->startOfSecond();
+        $this->travelTo($time);
+
+        // 改動可被 JSON 解析器忽略的位元組，或用過舊／過新的有效簽章，都應拒絕。
+        $this->postJson('/api/payment-notifications', $event)->assertForbidden();
+        $this->postSignedNotification(' ' . $body, signedBody: $body)->assertForbidden();
+        $this->postSignedNotification('{', signedBody: $body)->assertForbidden();
+        $this->postSignedNotification($body, $time->getTimestamp() - 301)->assertForbidden();
+        $this->postSignedNotification($body, $time->getTimestamp() + 301)->assertForbidden();
+        $this->assertDatabaseCount('payment_notification_receipts', 0);
+        $this->assertDatabaseCount('payment_anomalies', 0);
+
+        // 保留 JSON 整數的字面型別，避免測試編碼器把整數值的浮點轉為整數。
+        $invalid = [
+            ['eventId' => 'not-a-uuid'],
+            ['paymentId' => 'not-a-uuid'],
+            ['orderId' => '1'],
+            ['orderId' => true],
+            ['orderId' => 1.0],
+            ['orderId' => 9007199254740992],
+            ['amount' => '90'],
+            ['amount' => false],
+            ['amount' => 90.0],
+            ['amount' => 0],
+            ['amount' => 9007199254740992],
+            ['currency' => 123],
+            ['status' => 'pending'],
+            ['extra' => 'unexpected'],
+        ];
+        $this->postSignedNotification('{')->assertUnprocessable();
+        foreach ($invalid as $change) {
+            $payload = $change + ['eventId' => (string) Str::uuid()] + $event;
+            $raw = json_encode($payload, JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR);
+            $this->postSignedNotification($raw)->assertUnprocessable();
+        }
+        $this->getJson("/api/orders/$orderId")->assertOk()->assertExactJson($before);
+        $this->assertDatabaseCount('payment_anomalies', 0);
+    }
+
+    // 有效簽章不得讓後面的合法金額遮蔽重複欄位中的非法金額。
+    public function testSignedNotificationWithDuplicateAmountKeepsPaymentPending(): void
+    {
+        $this->insertFixture();
+        $binding = $this->startPendingPayment('notification-duplicate-amount');
+        $path = '/api/orders/' . $binding['orderId'];
+        $inventoryPath = '/api/stores/1/inventory';
+        $before = $this->getJson($path)->assertOk()->assertJsonPath('data.status', 'processing')->json();
+        $stock = $this->getJson($inventoryPath)->assertOk()->json();
+
+        // 直接拼入錯誤型別或錯誤金額，保留同名鍵及其 JSON 跳脫寫法。
+        foreach (['"amount":"90"', '"\u0061mount":91'] as $firstAmount) {
+            $eventId = (string) Str::uuid();
+            $event = ['eventId' => $eventId, 'status' => 'paid'] + $binding;
+            $valid = json_encode($event, JSON_THROW_ON_ERROR);
+            $duplicate = '{' . $firstAmount . ',' . substr($valid, 1);
+            $this->postSignedNotification($duplicate)->assertUnprocessable();
+            $this->postSignedNotification($duplicate)->assertUnprocessable();
+            $this->assertDatabaseHas('payment_notification_receipts', ['event_id' => $eventId, 'status' => 422]);
+        }
+
+        // 收件拒絕後仍維持處理中，訂單詳情與庫存可讀回原狀。
+        $this->getJson($path)->assertOk()->assertExactJson($before);
+        $this->getJson($inventoryPath)->assertOk()->assertExactJson($stock);
+    }
+
+    // 跳脫鍵名仍可用於有效通知，但事件識別重複時不能領取任何收件鍵。
+    public function testSignedNotificationRequiresOneUnambiguousEventId(): void
+    {
+        $this->insertFixture();
+        $binding = $this->startPendingPayment('notification-unambiguous-id');
+        $path = '/api/orders/' . $binding['orderId'];
+        $eventId = (string) Str::uuid();
+        $otherId = (string) Str::uuid();
+
+        // 用不同欄位順序、空白與合法跳脫字元，避免只接受原服務序列化的格式。
+        $template = <<<'JSON'
+            {
+                "status" : "\u0070aid",
+                "currency" : "\u0054WD",
+                "amount" : 90,
+                "orderId" : %d,
+                "payment\u0049d" : "%s",
+                "event\u0049d" : "%s"
+            }
+            JSON;
+        $valid = sprintf($template, $binding['orderId'], $binding['paymentId'], $eventId);
+        $ambiguous = '{"eventId":"' . $otherId . '",' . substr($valid, 1);
+        $this->postSignedNotification($ambiguous)->assertUnprocessable();
+        $this->assertDatabaseCount('payment_notification_receipts', 0);
+        $this->getJson($path)->assertOk()->assertJsonPath('data.status', 'processing');
+
+        // 確認合法原文可用同一事件完成付款，再測試帶有誤導性巢狀鍵的異內容重送。
+        $expected = ['data' => ['eventId' => $eventId]];
+        $this->postSignedNotification($valid)->assertOk()->assertExactJson($expected);
+        $settled = $this->getJson($path)->assertOk()->assertJsonPath('data.status', 'paid')->json('data');
+        $nestedAmount = '"amount":{"eventId":"inner","note":"x: } ] \"eventId\": y"}';
+        $conflict = '{' . $nestedAmount . ',' . substr($valid, 1);
+        $this->postSignedNotification($conflict)->assertConflict();
+        $this->postSignedNotification($conflict)->assertConflict();
+        $this->postSignedNotification($valid)->assertOk()->assertExactJson($expected);
+
+        // 保留一次異常及原終局，巢狀內容不能讓收件結果或既有異動被覆寫。
+        $this
+            ->getJson($path)
+            ->assertOk()
+            ->assertJsonPath('data.status', 'paid')
+            ->assertJsonPath('data.history', $settled['history'])
+            ->assertJsonPath('data.stockLedger', $settled['stockLedger'])
+            ->assertJsonCount(1, 'data.anomalies')
+            ->assertJsonPath('data.anomalies.0.reason', 'event_content_conflict');
+    }
+
+    // 異常只能歸給真實綁定的付款；衝突本文、錯誤綁定和相反終局不改變庫存及歷程。
+    public function testConflictingNotificationsKeepTheOriginalBindingAndDisposition(): void
+    {
+        $this->insertFixture();
+        $binding = $this->startPendingPayment('notification-conflict');
+        $other = $this->startPendingPayment('notification-unrelated', storeId: 2);
+        $this->authenticate(1);
+        $orderId = $binding['orderId'];
+        $otherId = $other['orderId'];
+        $path = "/api/orders/$orderId";
+        $otherPath = "/api/orders/$otherId";
+        $pending = $this->getJson($path)->assertOk()->json('data');
+        $untouched = $this->getJson($otherPath)->assertOk()->json();
+
+        // 金額、幣別及訂單不符各留下原因，幣別字串中的冒號和括號不影響欄位解析。
+        $invalid = [
+            'amount_mismatch' => ['amount' => 91],
+            'currency_mismatch' => ['currency' => 'T:WD}'],
+            'order_id_mismatch' => ['orderId' => $otherId],
+        ];
+        foreach ($invalid as $reason => $change) {
+            $eventId = (string) Str::uuid();
+            $body = json_encode($change + ['eventId' => $eventId, 'status' => 'paid'] + $binding, JSON_THROW_ON_ERROR);
+            $this->postSignedNotification($body)->assertConflict();
+            $this->postSignedNotification($body)->assertConflict();
+            $this->assertDatabaseHas('payment_anomalies', [
+                'notification_event_id' => $eventId, 'order_id' => $orderId, 'reason' => $reason,
+            ]);
+        }
+        $this
+            ->getJson($path)
+            ->assertOk()
+            ->assertJsonPath('data.payment', $pending['payment'])
+            ->assertJsonPath('data.history', $pending['history'])
+            ->assertJsonPath('data.stockLedger', $pending['stockLedger'])
+            ->assertJsonCount(3, 'data.anomalies');
+
+        // 查不到付款識別時保留異常，但不採信本文提供的訂單識別。
+        $orphan = (string) Str::uuid();
+        $body = json_encode([
+            'eventId' => $orphan, 'status' => 'paid', 'paymentId' => (string) Str::uuid(),
+        ] + $other, JSON_THROW_ON_ERROR);
+        $this->postSignedNotification($body)->assertConflict();
+        $this->assertDatabaseHas('payment_anomalies', [
+            'notification_event_id' => $orphan, 'order_id' => null, 'reason' => 'payment_id_mismatch',
+        ]);
+
+        // 有效失敗只釋放保留；同識別的異內容只連到首次收件的可信訂單。
+        $eventId = (string) Str::uuid();
+        $event = ['eventId' => $eventId, 'status' => 'failed'];
+        $body = json_encode($event + $binding, JSON_THROW_ON_ERROR);
+        $this->postSignedNotification($body)->assertOk();
+        $this->postSignedNotification($body)->assertOk();
+        $changed = json_encode($event + $other, JSON_THROW_ON_ERROR);
+        $this->postSignedNotification($changed)->assertConflict();
+        $this->postSignedNotification($changed)->assertConflict();
+        $opposite = ['eventId' => (string) Str::uuid(), 'status' => 'paid'] + $binding;
+        $this->postSignedNotification(json_encode($opposite, JSON_THROW_ON_ERROR))->assertConflict();
+        $this->postSignedNotification($body)->assertOk();
+
+        // 比對終局詳情、歷程、可售量及另一店的原資料，確保錯誤內容沒有業務副作用。
+        $settled = $this
+            ->getJson($path)
+            ->assertOk()
+            ->assertJsonPath('data.payment', [
+                'id' => $binding['paymentId'], 'status' => 'failed', 'pendingReason' => null,
+            ])
+            ->assertJsonCount(5, 'data.anomalies')
+            ->assertJsonPath('data.anomalies.3.reason', 'event_content_conflict')
+            ->assertJsonPath('data.anomalies.4.reason', 'terminal_conflict');
+        self::assertSame(
+            ['awaiting_payment', 'processing', 'failed'],
+            array_column($settled->json('data.history'), 'status'),
+        );
+        self::assertSame(['reserved', 'released'], array_column($settled->json('data.stockLedger'), 'type'));
+        $this->getJson($otherPath)->assertOk()->assertExactJson($untouched);
+        $this
+            ->getJson('/api/stores/1/inventory')
+            ->assertOk()
+            ->assertJsonPath('data.0.onHand', 12)
+            ->assertJsonPath('data.0.available', 12);
+    }
+
+    // 總部可代理派送，只有收到相符的持久化回覆才向前端確認已排入。
+    public function testHeadquartersDispatchAuthorizesAndValidatesTheRemoteAcceptance(): void
+    {
+        $this->insertFixture();
+        $paymentId = (string) Str::uuid();
+        $eventId = (string) Str::uuid();
+        $path = "/api/mock-payments/$paymentId/dispatch";
+        $url = "http://mock-payment:8000/api/payments/$paymentId/dispatch";
+        $accepted = ['data' => ['eventId' => $eventId, 'mode' => 'delayed']];
+        Http::preventStrayRequests()->fake([
+            $url => Http::sequence()
+                ->push($accepted, 202)
+                ->pushStatus(409)
+                ->pushStatus(404)
+                ->push($accepted, 202)
+                ->push($accepted, 200),
+        ]);
+
+        // 未登入及店員皆不得外呼；總部只接受固定的 JSON 模式欄位。
+        $this->postJson($path, ['mode' => 'immediate'])->assertUnauthorized();
+        $this->authenticate(2);
+        $this->postJson($path, ['mode' => 'immediate'])->assertForbidden();
+        $this->authenticate(1);
+        $invalid = [['mode' => ' delayed '], ['mode' => true], ['mode' => 'delayed', 'delay' => 1], ['delayed']];
+        foreach ($invalid as $body) {
+            $this->postJson($path, $body)->assertUnprocessable();
+        }
+        $duplicateMode = '{"mode":"immediate","mode":"delayed"}';
+        $this
+            ->call('POST', $path, [], [], [], ['CONTENT_TYPE' => 'application/json'], $duplicateMode)
+            ->assertUnprocessable();
+        Http::assertNothingSent();
+
+        // 保留遠端衝突及查無回應；對不相符模式或 HTTP 狀態回報服務錯誤。
+        $this->postJson($path, ['mode' => 'delayed'])->assertAccepted()->assertExactJson($accepted);
+        $this->postJson($path, ['mode' => 'immediate'])->assertConflict();
+        $this->postJson($path, ['mode' => 'immediate'])->assertNotFound();
+        $this->postJson($path, ['mode' => 'immediate'])->assertServiceUnavailable();
+        $this->postJson($path, ['mode' => 'delayed'])->assertServiceUnavailable();
+
+        // 驗證實際外呼只攜帶核對後的欄位。
+        Http::assertSent(static fn (Request $request): bool => $request->method() === 'POST'
+            && $request->url() === $url
+            && $request->data() === ['mode' => 'delayed']);
+    }
+
     // 首次付款必須先保存固定識別與待辦，再由 HTTP 取得模擬金流的待處理結果。
     public function testPaymentStartRecordsIntentBeforeCallingMockPayment(): void
     {
@@ -1217,6 +1502,46 @@ final class OrderApiTest extends TestCase
             ->assertJsonPath('data.status', 'awaiting_payment');
     }
 
+    // 透過店員入口建立待處理付款，保留由公開回應取得的固定綁定。
+    private function startPendingPayment(string $key, int $storeId = 1): array
+    {
+        $this->authenticate($storeId + 1);
+        $orderId = $this
+            ->createOrder($key, [['productId' => 1, 'quantity' => 2]], $storeId)
+            ->assertCreated()
+            ->json('data.id');
+
+        // 在 HTTP 邊界模擬待處理結果，訂單付款意圖仍由真實交易寫入。
+        Http::fake(static fn (Request $request): PromiseInterface => Http::response([
+            'data' => ['status' => 'pending'] + $request->data(),
+        ]));
+        $paymentId = $this
+            ->postJson("/api/orders/$orderId/payment")
+            ->assertOk()
+            ->assertJsonPath('data.payment.pendingReason', 'awaiting_result')
+            ->json('data.payment.id');
+
+        return ['paymentId' => $paymentId, 'orderId' => $orderId, 'amount' => 90, 'currency' => 'TWD'];
+    }
+
+    // 直接送指定的原始位元組，避免測試工具重編碼後掩蓋驗簽錯誤。
+    private function postSignedNotification(
+        string $body,
+        ?int $timestamp = null,
+        ?string $signedBody = null,
+    ): TestResponse {
+        $key = 'order-api-notification-test-key';
+        config(['services.payment_notifications.key' => $key]);
+        $timestamp ??= now()->getTimestamp();
+
+        // 傳送時間及簽章只取自測試指定值，可個別改變本文與傳送時間。
+        return $this->call('POST', '/api/payment-notifications', [], [], [], [
+            'CONTENT_TYPE' => 'application/json',
+            'HTTP_X_PAYMENT_TIMESTAMP' => (string) $timestamp,
+            'HTTP_X_PAYMENT_SIGNATURE' => hash_hmac('sha256', $timestamp . '.' . ($signedBody ?? $body), $key),
+        ], $body);
+    }
+
     // 明確保留原始位元組，供 JSON 類型及本文大小驗收。
     private function postRawOrder(string $body): TestResponse
     {
@@ -1227,18 +1552,6 @@ final class OrderApiTest extends TestCase
     private function createOrder(string $key, array $items, int $storeId = 1): TestResponse
     {
         return $this->postJson('/api/orders', ['storeId' => $storeId, 'operationKey' => $key, 'items' => $items]);
-    }
-
-    // 在隔離的測試交易覆寫資料庫牆鐘；交易回滾會移除設定及函式。
-    private function setDatabaseClock(string $time): void
-    {
-        DB::statement('CREATE SCHEMA IF NOT EXISTS order_api_clock');
-        DB::unprepared(<<<'SQL'
-            CREATE OR REPLACE FUNCTION order_api_clock.clock_timestamp() RETURNS timestamptz
-            LANGUAGE sql VOLATILE AS $$ SELECT current_setting('store_ordering.test_clock')::timestamptz $$
-            SQL);
-        DB::statement('SET LOCAL search_path TO order_api_clock, pg_catalog, public');
-        DB::scalar("SELECT set_config('store_ordering.test_clock', ?, true)", [$time]);
     }
 
     // 檢查同一份詳情中，每個原始保留各自對應一次完整釋放。
