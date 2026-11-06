@@ -1,0 +1,17 @@
+**
+!Dockerfile
+!backend/
+!backend/**
+backend/.env*
+backend/vendor/
+backend/public/build/
+backend/public/hot
+backend/storage/**
+backend/bootstrap/cache/*.php
+backend/.phpunit.cache/
+backend/.phpunit.result.cache
+!frontend/
+!frontend/**
+frontend/.env*
+frontend/node_modules/
+frontend/dist/

@@ -1,0 +1,174 @@
+/* 單欄版面及配色沿用第一案，保留手機畫面與鍵盤操作所需的空間。 */
+:root {
+  font-family: system-ui, sans-serif;
+  line-height: 1.5;
+  color: #17243a;
+  background: #f5f7fa;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.shell {
+  max-width: 40rem;
+  margin: 3rem auto;
+  padding-inline: 1.25rem;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  margin-bottom: 1rem;
+  font-size: 1.75rem;
+}
+
+h2 {
+  font-size: 1.25rem;
+}
+
+.panel {
+  padding: 1.25rem;
+  border: 1px solid #d6dce5;
+  border-radius: 0.5rem;
+  background: #fff;
+}
+
+/* 原生控制保有標籤、鍵盤順序及清楚的焦點。 */
+button,
+input,
+select {
+  min-height: 2.75rem;
+  border: 1px solid #77859a;
+  border-radius: 0.375rem;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+}
+
+input,
+select {
+  width: 100%;
+  min-width: 0;
+  padding: 0.5rem 0.625rem;
+}
+
+button {
+  padding: 0.5rem 0.875rem;
+  border-color: #244c82;
+  background: #244c82;
+  color: #fff;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: #fff;
+  color: #244c82;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 3px solid #b35800;
+  outline-offset: 3px;
+}
+
+.login-form,
+.store-field {
+  display: grid;
+  gap: 0.375rem;
+  max-width: 24rem;
+}
+
+.login-form {
+  margin-top: 1rem;
+}
+
+.login-form input + label {
+  margin-top: 0.5rem;
+}
+
+.login-form button {
+  justify-self: start;
+  margin-top: 0.75rem;
+}
+
+.feedback:not(:empty) {
+  margin-bottom: 0.75rem;
+}
+
+.retry button {
+  margin-top: 0.5rem;
+}
+
+/* 保留原生表格語意，長商品名稱及大數字在欄內換行。 */
+.panel-header,
+.pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.panel-header,
+.store-field,
+.store-name {
+  margin-bottom: 1rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+th,
+td {
+  padding: 0.625rem 0.375rem;
+  border-bottom: 1px solid #d6dce5;
+  text-align: right;
+}
+
+thead {
+  background: #f5f7fa;
+}
+
+th:first-child {
+  width: 34%;
+  text-align: left;
+}
+
+.pagination {
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+
+@media (max-width: 480px) {
+  .shell {
+    margin-block: 1.5rem;
+  }
+
+  .panel {
+    padding: 1rem;
+  }
+
+  th,
+  td {
+    padding-inline: 0.25rem;
+    font-size: 0.875rem;
+  }
+}

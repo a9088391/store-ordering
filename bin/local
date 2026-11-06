@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+# 固定專案、資料庫與對外埠，讓展示和自動化測試有各自的 Compose 資源。
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+case "${1:-}" in
+    demo)
+        project=store-ordering
+        export STORE_ORDERING_DATABASE=store_ordering STORE_ORDERING_PORT=8010
+        export STORE_ORDERING_SESSION_COOKIE=store_ordering_session
+        ;;
+    test)
+        project=store-ordering-test
+        export STORE_ORDERING_DATABASE=store_ordering_test STORE_ORDERING_PORT=8011
+        export STORE_ORDERING_SESSION_COOKIE=store_ordering_test_session
+        ;;
+    *)
+        printf '用法：bin/local {demo|test} {up|restart|down|ps|phpunit}\n' >&2
+        exit 2
+        ;;
+esac
+local_dir=".local/$1"
+command="${2:-}"
+if [ "$#" -ne 2 ]; then
+    printf '用法：bin/local {demo|test} {up|restart|down|ps|phpunit}\n' >&2
+    exit 2
+fi
+
+# 確認 Docker 指令只使用本機 Unix socket，避免把建置內容或私密掛載送往遠端。
+if [ -n "${DOCKER_CONTEXT:-}" ] || [ -z "${DOCKER_HOST:-}" ]; then
+    endpoint="$(docker context inspect "$(docker context show)" --format '{{.Endpoints.docker.Host}}')"
+else
+    endpoint="$DOCKER_HOST"
+fi
+case "$endpoint" in
+    unix:///*) ;;
+    *)
+        printf '本案需要使用本機 Docker Unix socket。\n' >&2
+        exit 2
+        ;;
+esac
+
+# 讓私密值一律來自本模式的檔案，避免 Compose 優先套用外部 shell 的同名變數。
+unset STORE_ORDERING_APP_KEY STORE_ORDERING_DB_PASSWORD STORE_ORDERING_POSTGRES_PASSWORD
+compose=(docker compose -f compose.yaml -p "$project" --env-file "$local_dir/runtime.env")
+
+# 原子建立權限為 0600 的檔案，重跑時沿用既有值，避免密鑰或密碼中途被覆寫。
+write_private_file() {
+    local target="$1" content="$2" temporary
+    # 先在同一目錄寫完私密內容，避免其他啟動程序讀到半份檔案。
+    temporary="$(mktemp "$local_dir/.init.XXXXXX")"
+    if ! printf '%s\n' "$content" > "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    # 硬連結在目的地存在時會失敗，保留先完成的初始化設定。
+    if ! ln -- "$temporary" "$target" 2>/dev/null; then
+        if [ ! -f "$target" ] || [ -L "$target" ]; then
+            rm -f -- "$temporary"
+            return 1
+        fi
+    fi
+    rm -f -- "$temporary"
+}
+
+# 啟動前核對私密檔案位置；已有資料庫時，缺少執行密鑰需由本機備份復原。
+prepare_runtime() {
+    local app_key db_password postgres_password
+    # 私密目錄與檔案需在專案內，並限制為目前使用者可讀。
+    if [[
+        -L .local
+        || -L "$local_dir"
+        || -L "$local_dir/runtime.env"
+    ]]; then
+        printf '拒絕以符號連結存放本機設定。\n' >&2
+        return 1
+    fi
+    mkdir -p -- "$local_dir"
+    chmod 700 .local "$local_dir"
+
+    # 只有資料庫尚未初始化時才能產生新密鑰與連線密碼。
+    if [ ! -f "$local_dir/runtime.env" ]; then
+        if docker volume inspect "${project}_postgres-data" >/dev/null 2>&1; then
+            printf '本案資料庫已存在，請先復原 %s/runtime.env。\n' "$local_dir" >&2
+            return 1
+        fi
+
+        app_key="$(openssl rand -base64 32)"
+        db_password="$(openssl rand -hex 24)"
+        postgres_password="$(openssl rand -hex 24)"
+        write_private_file "$local_dir/runtime.env" "$(printf '%s\n' \
+            "STORE_ORDERING_APP_KEY=base64:$app_key" \
+            "STORE_ORDERING_DB_PASSWORD=$db_password" \
+            "STORE_ORDERING_POSTGRES_PASSWORD=$postgres_password")"
+    fi
+    chmod 600 "$local_dir/runtime.env"
+}
+
+# 產生三個示範密碼；檔案只在初始化的單次容器中以唯讀方式掛載。
+prepare_accounts() {
+    local hq taipei taichung
+    # 拒絕跟隨符號連結，缺檔且已有資料時要求還原既有帳密。
+    if [ -L "$local_dir/accounts.json" ]; then
+        printf '拒絕以符號連結存放示範密碼。\n' >&2
+        return 1
+    fi
+    if [ ! -f "$local_dir/accounts.json" ]; then
+        if docker volume inspect "${project}_postgres-data" >/dev/null 2>&1; then
+            printf '本案資料庫已存在，請先復原 %s/accounts.json。\n' "$local_dir" >&2
+            return 1
+        fi
+        # 用獨立的隨機值建立每組帳號，且只寫入本機帳密檔。
+        hq="$(openssl rand -hex 18)"
+        taipei="$(openssl rand -hex 18)"
+        taichung="$(openssl rand -hex 18)"
+        write_private_file "$local_dir/accounts.json" "$(printf \
+            '{"hq@example.test":"%s","taipei@example.test":"%s","taichung@example.test":"%s"}' \
+            "$hq" "$taipei" "$taichung")"
+    fi
+    chmod 600 "$local_dir/accounts.json"
+}
+
+case "$command" in
+    up)
+        # 資料庫就緒並完成遷移與冪等初始化後，才啟動網站。
+        docker info --format "{{.ServerVersion}}" >/dev/null
+        prepare_runtime
+        prepare_accounts
+        "${compose[@]}" build app
+        "${compose[@]}" up -d --wait db
+        "${compose[@]}" stop app
+        # 每次 up 都核對並補齊本案資料庫資源，避免首次中斷留下半套環境。
+        "${compose[@]}" exec -T --user postgres db bash /opt/store-ordering/init-db.sh
+        "${compose[@]}" run --rm -T --no-deps app php artisan migrate --force
+        # macOS 主機檔案屬於目前使用者，單次初始化沿用容器 root 讀取 0600 檔案。
+        "${compose[@]}" run --rm -T --no-deps --user root \
+            -v "$PWD/$local_dir/accounts.json:/setup/accounts.json:ro" \
+            app php artisan store-ordering:seed-demo /setup/accounts.json
+        "${compose[@]}" up -d --wait app
+        printf '網站 http://127.0.0.1:%s，初始帳密 %s/accounts.json\n' \
+            "$STORE_ORDERING_PORT" "$local_dir"
+        ;;
+    restart)
+        "${compose[@]}" restart
+        "${compose[@]}" start --wait --wait-timeout 60
+        ;;
+    down|ps)
+        "${compose[@]}" "$command"
+        ;;
+    phpunit)
+        # 測試僅接受 test 模式，容器內也會核對實際 PostgreSQL 資料庫。
+        if [ "$project" != store-ordering-test ]; then
+            printf 'PHPUnit 只可透過 bin/local test phpunit 執行。\n' >&2
+            exit 2
+        fi
+        "${compose[@]}" exec -T -e APP_ENV=testing -e DB_DATABASE=store_ordering_phpunit \
+            app vendor/bin/phpunit --do-not-cache-result
+        ;;
+    *)
+        printf '用法：bin/local {demo|test} {up|restart|down|ps|phpunit}\n' >&2
+        exit 2
+        ;;
+esac
