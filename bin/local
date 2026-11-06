@@ -123,13 +123,13 @@ prepare_accounts() {
 
 case "$command" in
     up)
-        # 資料庫就緒並完成遷移與冪等初始化後，才啟動網站。
+        # 資料庫就緒並完成遷移與冪等初始化後，才啟動網站與到期排程。
         docker info --format "{{.ServerVersion}}" >/dev/null
         prepare_runtime
         prepare_accounts
         "${compose[@]}" build app
         "${compose[@]}" up -d --wait db
-        "${compose[@]}" stop app
+        "${compose[@]}" stop app scheduler
         # 每次 up 都核對並補齊本案資料庫資源，避免首次中斷留下半套環境。
         "${compose[@]}" exec -T --user postgres db bash /opt/store-ordering/init-db.sh
         "${compose[@]}" run --rm -T --no-deps app php artisan migrate --force
@@ -137,7 +137,7 @@ case "$command" in
         "${compose[@]}" run --rm -T --no-deps --user root \
             -v "$PWD/$local_dir/accounts.json:/setup/accounts.json:ro" \
             app php artisan store-ordering:seed-demo /setup/accounts.json
-        "${compose[@]}" up -d --wait app
+        "${compose[@]}" up -d --wait --no-build --pull never app scheduler
         printf '網站 http://127.0.0.1:%s，初始帳密 %s/accounts.json\n' \
             "$STORE_ORDERING_PORT" "$local_dir"
         ;;

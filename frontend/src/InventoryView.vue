@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, shallowRef, watch } from 'vue'
 import { ApiError, getInventory, getStores, type InventoryPage, type Store } from './api'
+import OrdersView from './OrdersView.vue'
 
-const props = defineProps<{ role: 'headquarters' | 'staff' }>()
+const props = defineProps<{ role: 'headquarters' | 'staff'; actorId: number; csrfToken: string }>()
 const emit = defineEmits<{ logout: []; sessionExpired: [] }>()
 
 const stores = shallowRef<Store[] | null>(null)
@@ -71,8 +72,8 @@ watch([storeId, page, inventoryRetry], async ([id, currentPage], [previousId], o
   }
 })
 
-// 店員只需看見後端提供的本店名稱，總部才有門市選擇控制。
-const staffStoreName = computed(() => stores.value?.[0]?.name)
+// 庫存和訂單共用後端授權的門市，避免顯示未選取門市的資料。
+const selectedStore = computed(() => stores.value?.find((store) => store.id === storeId.value))
 </script>
 
 <template>
@@ -96,7 +97,7 @@ const staffStoreName = computed(() => stores.value?.[0]?.name)
           <option v-for="store in stores" :key="store.id" :value="store.id">{{ store.name }}</option>
         </select>
       </div>
-      <p v-else class="store-name">門市：{{ staffStoreName }}</p>
+      <p v-else class="store-name">門市：{{ selectedStore?.name }}</p>
 
       <!-- 用原生欄位標題保留表格語意，整數零庫存與其他數值一樣顯示。 -->
       <div v-if="inventoryFailure" class="retry">
@@ -132,4 +133,16 @@ const staffStoreName = computed(() => stores.value?.[0]?.name)
       </nav>
     </template>
   </section>
+
+  <!-- 訂單操作回讀同一庫存頁；換店則卸載舊訂單狀態與未完成查詢。 -->
+  <OrdersView
+    v-if="selectedStore"
+    :key="selectedStore.id"
+    :store="selectedStore"
+    :actor-id="props.actorId"
+    :csrf-token="props.csrfToken"
+    :products="inventory?.data ?? []"
+    @session-expired="emit('sessionExpired')"
+    @stock-changed="inventoryRetry++"
+  />
 </template>

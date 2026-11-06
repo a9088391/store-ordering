@@ -3,13 +3,14 @@ name: store-ordering
 services:
   app:
     build: .
+    image: ${COMPOSE_PROJECT_NAME}-app
     init: true
-    cpus: 1.5
-    mem_limit: 2g
-    depends_on:
+    cpus: 1.25
+    mem_limit: 1792m
+    depends_on: &app-dependencies
       db:
         condition: service_healthy
-    environment:
+    environment: &app-environment
       APP_NAME: 門市訂單系統
       APP_ENV: local
       APP_DEBUG: "false"
@@ -24,6 +25,8 @@ services:
       SESSION_COOKIE: ${STORE_ORDERING_SESSION_COOKIE:?請執行 bin/local}
       CACHE_STORE: database
       LOG_CHANNEL: stderr
+      # 本機 PHP 伺服器以多個程序處理獨立會話，讓 HTTP 可重現交易競爭。
+      PHP_CLI_SERVER_WORKERS: "4"
     ports:
       - "127.0.0.1:${STORE_ORDERING_PORT:?請執行 bin/local}:8000"
     healthcheck:
@@ -31,6 +34,16 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  scheduler:
+    # 使用相同映像與資料庫角色執行到期工作，排程器不開放 HTTP 連接埠。
+    image: ${COMPOSE_PROJECT_NAME}-app
+    init: true
+    cpus: 0.25
+    mem_limit: 256m
+    depends_on: *app-dependencies
+    environment: *app-environment
+    command: [php, artisan, "schedule:work", "--no-interaction"]
 
   db:
     image: postgres:18.6-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5

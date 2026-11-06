@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use App\Http\Controllers\CatalogController;
+use App\Http\Controllers\OrderController;
 use App\Http\Controllers\SessionController;
 use Illuminate\Support\Facades\Route;
 
@@ -22,5 +23,11 @@ Route::prefix('api')
             Route::get('/stores', [CatalogController::class, 'stores']);
             Route::get('/stores/{store}/inventory', [CatalogController::class, 'inventory'])->whereNumber('store');
             Route::get('/products', [CatalogController::class, 'products']);
+
+            // 訂單讀寫沿用現有的身分、會話期限及 CSRF middleware。
+            Route::get('/orders', [OrderController::class, 'index']);
+            Route::post('/orders', [OrderController::class, 'create']);
+            Route::get('/orders/{order}', [OrderController::class, 'show'])->whereNumber('order');
+            Route::post('/orders/{order}/cancel', [OrderController::class, 'cancel'])->whereNumber('order');
         });
     });

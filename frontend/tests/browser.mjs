@@ -39,6 +39,33 @@ async function expectInventory(page, coffee, cookies) {
   ])
 }
 
+// 比對保留或釋放後的實存量與可售量，確認建單不直接扣除實存。
+async function expectInventoryBalances(page, coffeeOnHand, coffeeAvailable, cookiesOnHand, cookiesAvailable) {
+  const table = page.getByRole('table', { name: '門市庫存明細' })
+
+  // 等待兩個商品指定的可售量都更新後，再讀取整張庫存表。
+  for (const [name, available] of [
+    ['濾掛咖啡', coffeeAvailable],
+    ['燕麥餅乾', cookiesAvailable],
+  ]) {
+    // 只看可售欄，避免實存量相同時誤判為畫面已回讀。
+    await page.waitForFunction(({ productName, expected }) => {
+      const row = Array.from(document.querySelectorAll('table[aria-label="門市庫存明細"] tbody tr'))
+        .find((entry) => entry.cells[0].textContent === productName)
+      return row?.cells[3].textContent === expected
+    }, { productName: name, expected: String(available) })
+  }
+
+  const rows = await table.locator('tbody tr').evaluateAll(
+    // 從列標題識別商品，讀取單價後的實存量及可售量。
+    (entries) => entries.map((row) => [row.cells[0].textContent, row.cells[2].textContent, row.cells[3].textContent]),
+  )
+  assert.deepEqual(rows, [
+    ['濾掛咖啡', String(coffeeOnHand), String(coffeeAvailable)],
+    ['燕麥餅乾', String(cookiesOnHand), String(cookiesAvailable)],
+  ])
+}
+
 // 確認桌機、手機及斷點兩側都沒有水平溢位，資料也留在各自欄位內。
 async function expectReadableTable(page) {
   for (const width of [320, 390, 480, 481, 1280]) {
@@ -59,6 +86,33 @@ async function expectReadableTable(page) {
   }
 }
 
+// 在手機與桌機寬度核對訂單面板及原生控制項都留在可視範圍。
+async function expectOrderLayout(page) {
+  for (const width of [320, 1280]) {
+    await page.setViewportSize({ width, height: 900 })
+
+    // 檢查整頁、面板及每個表單控制項的實際位置。
+    const measured = await page.evaluate(() => {
+      const panel = document.querySelector('.order-panel')
+      // 以元素邊界統一檢查面板與控制項是否留在視窗內。
+      const bounds = (element) => {
+        const rect = element.getBoundingClientRect()
+        return { left: rect.left, right: rect.right }
+      }
+      return {
+        width: window.innerWidth,
+        content: document.documentElement.scrollWidth,
+        panel: bounds(panel),
+        controls: Array.from(panel.querySelectorAll('input, select, button'), bounds),
+      }
+    })
+    assert.equal(measured.width, width)
+    assert.equal(measured.content, width)
+    assert.ok(measured.panel.left >= 0 && measured.panel.right <= width)
+    assert.equal(measured.controls.every(({ left, right }) => left >= 0 && right <= width), true)
+  }
+}
+
 // 驗證登出後的登入表單可用，且重載不會再顯示上一位使用者的庫存。
 async function expectLogout(page) {
   await page.getByRole('button', { name: '登出' }).click()
@@ -72,6 +126,9 @@ async function expectLogout(page) {
 let phase = '啟動本機 Chrome'
 let browser
 const fixturePasswords = []
+const orderRequestBodies = []
+let orderPostCount = 0
+let committedOrderId
 
 try {
   browser = await chromium.launch({ executablePath: chrome })
@@ -146,6 +203,92 @@ try {
   await page.reload()
   await expectInventory(page, 12, 3)
 
+  // 總部建立多品項訂單；真實 API 已提交後刻意丟棄瀏覽器收到的回應。
+  phase = '驗證訂單建立即使回應遺失仍可恢復同一筆'
+  await page.getByRole('heading', { name: '建立訂單', exact: true }).waitFor()
+  await page.getByLabel('商品', { exact: true }).selectOption({ label: '濾掛咖啡' })
+  await page.getByRole('button', { name: '新增品項', exact: true }).click()
+  await page.getByLabel('商品', { exact: true }).selectOption({ label: '燕麥餅乾' })
+  await page.getByRole('button', { name: '新增品項', exact: true }).click()
+  await page.getByLabel('數量（濾掛咖啡）', { exact: true }).fill('2')
+  await page.getByLabel('數量（燕麥餅乾）', { exact: true }).fill('1')
+
+  // 留下每次實際送出的本文，以逐字確認恢復時沒有換鍵或改內容。
+  page.on('request', (request) => {
+    if (request.url() === `${origin}/api/orders` && request.method() === 'POST') {
+      orderRequestBodies.push(request.postData())
+    }
+  })
+  // 第一個 POST 由真實 API 執行並回傳 201，測試只丟棄送回頁面的回應。
+  await page.route(`${origin}/api/orders`, async (route) => {
+    if (route.request().method() !== 'POST') return route.continue()
+    orderPostCount++
+    if (orderPostCount === 1) {
+      const committed = await route.fetch()
+      assert.equal(committed.status(), 201)
+      const created = (await committed.json()).data
+      assert.equal(Number.isSafeInteger(created.id) && created.id > 0, true)
+      committedOrderId = created.id
+      assert.equal(created.storeId, 1)
+      assert.equal(created.status, 'awaiting_payment')
+      assert.equal(created.total, 150)
+      assert.deepEqual(created.items.map(({ name, quantity, unitPrice, subtotal }) => ({
+        name, quantity, unitPrice, subtotal,
+      })), [
+        { name: '濾掛咖啡', quantity: 2, unitPrice: 45, subtotal: 90 },
+        { name: '燕麥餅乾', quantity: 1, unitPrice: 60, subtotal: 60 },
+      ])
+      await route.abort()
+      return
+    }
+    if (orderPostCount === 2) {
+      // 明確確認後模擬一次 CSRF 失效；不把測試回應當成後端安全驗收。
+      await route.fulfill({
+        status: 419,
+        contentType: 'application/json',
+        body: JSON.stringify({ message: 'CSRF token mismatch.' }),
+      })
+      return
+    }
+    if (orderPostCount === 3) {
+      // 以真實成功回應為底改成空異動清單，確認缺少明細時不會誤判為完成。
+      const committed = await route.fetch()
+      assert.equal(committed.status(), 200)
+      const payload = await committed.json()
+      assert.equal(payload.data.id, committedOrderId)
+      assert.equal(payload.data.stockLedger.length, 2)
+      const emptyLedgerOrder = { ...payload.data, stockLedger: [] }
+      await route.fulfill({
+        status: committed.status(),
+        contentType: 'application/json',
+        body: JSON.stringify({ ...payload, data: emptyLedgerOrder }),
+      })
+      return
+    }
+    await route.abort()
+  })
+
+  await page.getByRole('button', { name: '建立訂單', exact: true }).click()
+  await page.getByRole('status').filter({
+    hasText: '建立結果尚未確認。請使用原內容確認同一筆訂單。',
+  }).waitFor()
+  const firstBody = orderRequestBodies[0]
+  assert.equal(typeof firstBody, 'string')
+  const firstDraft = JSON.parse(firstBody)
+  assert.equal(firstDraft.storeId, 1)
+  assert.equal(typeof firstDraft.operationKey, 'string')
+  assert.notEqual(firstDraft.operationKey, '')
+  assert.deepEqual(firstDraft.items.map(({ quantity }) => quantity), [2, 1])
+  assert.equal(new Set(firstDraft.items.map(({ productId }) => productId)).size, 2)
+  // 後續重載及身分切換也會核對沒有自動重送。
+  assert.equal(orderPostCount, 1)
+
+  // 同帳號重載會恢復確認按鈕，但不會自行再寫入。
+  await page.reload()
+  await page.getByRole('button', { name: '確認同一筆訂單', exact: true }).waitFor()
+  await expectInventoryBalances(page, 12, 10, 3, 2)
+  assert.equal(orderPostCount, 1)
+
   phase = '驗證總部登出與重載'
   await expectLogout(page)
 
@@ -157,15 +300,151 @@ try {
     phase = `驗證${name}店員登入、本店庫存與登出`
     await submitLogin(page, email, accounts[email])
     await page.getByText(`門市：${name}`, { exact: true }).waitFor()
-    assert.equal(await page.getByRole('combobox').count(), 0)
-    await expectInventory(page, coffee, cookies)
+    assert.equal(await page.getByLabel('門市', { exact: true }).count(), 0)
+    if (name === '台北門市') {
+      // 其他登入身分看得到共享庫存異動，但不顯示總部的待確認內容。
+      await expectInventoryBalances(page, 12, 10, 3, 2)
+      assert.equal(await page.getByRole('button', { name: '確認同一筆訂單', exact: true }).count(), 0)
+      assert.equal(await page.getByRole('button', { name: '建立訂單', exact: true }).isEnabled(), false)
+      assert.equal(orderPostCount, 1)
+    } else {
+      await expectInventory(page, coffee, cookies)
+    }
     await expectLogout(page)
   }
+
+  // 回到原總部身分後，先驗證待辦仍在，再經一次 419 恢復原始本文。
+  phase = '驗證明確重送、查單、取消與庫存釋放'
+  await submitLogin(page, emails[0], accounts[emails[0]])
+  await page.getByRole('heading', { name: '門市訂單', exact: true }).waitFor()
+  const confirmation = page.getByRole('button', { name: '確認同一筆訂單', exact: true })
+  await confirmation.waitFor()
+  assert.equal(orderPostCount, 1)
+  await confirmation.click()
+  await page.getByRole('status').filter({ hasText: '登入狀態已更新。' }).waitFor()
+  await page.getByRole('button', { name: '確認同一筆訂單', exact: true }).waitFor()
+  assert.equal(orderPostCount, 2)
+  assert.equal(orderRequestBodies[1], orderRequestBodies[0])
+  await expectInventoryBalances(page, 12, 10, 3, 2)
+  assert.equal(orderPostCount, 2)
+
+  // 後端已提交重送，但不完整的回應不得被當成確認，也不得清掉原始待辦。
+  await confirmation.click()
+  await page.getByRole('status').filter({
+    hasText: '建立結果尚未確認。請使用原內容確認同一筆訂單。',
+  }).waitFor()
+  await confirmation.waitFor()
+  assert.equal(orderPostCount, 3)
+  assert.equal(orderRequestBodies[2], orderRequestBodies[0])
+  const retainedPending = await page.evaluate(() => (
+    Object.entries(sessionStorage).filter(([key]) => key.startsWith('store-ordering:pending-order:'))
+  ))
+  assert.equal(retainedPending.length, 1)
+  assert.match(retainedPending[0][0], /^store-ordering:pending-order:\d+:1$/)
+  assert.equal(retainedPending[0][1], orderRequestBodies[0])
+
+  // 重載確認原始操作仍待明確確認，期間沒有自動重送。
+  await page.reload()
+  await page.getByRole('button', { name: '確認同一筆訂單', exact: true }).waitFor()
+  assert.equal(orderPostCount, 3)
+  assert.deepEqual(
+    await page.evaluate(() => (
+      Object.entries(sessionStorage).filter(([key]) => key.startsWith('store-ordering:pending-order:'))
+    )),
+    retainedPending,
+  )
+
+  // 再次明確確認後才接受未修改的真實 200，並比對原始建立回應中的單號。
+  await page.unroute(`${origin}/api/orders`)
+  const replayResponsePromise = page.waitForResponse((response) => (
+    response.url() === `${origin}/api/orders` && response.request().method() === 'POST'
+  ))
+  await page.getByRole('button', { name: '確認同一筆訂單', exact: true }).click()
+  const replayResponse = await replayResponsePromise
+  assert.equal(replayResponse.status(), 200)
+  const replayedOrder = (await replayResponse.json()).data
+  const orderId = replayedOrder.id
+  assert.equal(orderId, committedOrderId)
+  assert.equal(orderRequestBodies[3], orderRequestBodies[0])
+  assert.equal(replayedOrder.total, 150)
+  await page.getByRole('status').filter({ hasText: `已確認訂單 #${orderId}。` }).waitFor()
+
+  // 訂單保留只減少可售量，實存仍維持原數字；明細顯示後端價格快照及歷程。
+  await page.getByRole('heading', { name: `訂單 #${orderId}`, exact: true }).waitFor()
+  await expectInventoryBalances(page, 12, 10, 3, 2)
+  const detail = page.getByRole('region', { name: `訂單 #${orderId}` })
+  await detail.getByText('150 元', { exact: true }).waitFor()
+  await detail.getByText(/濾掛咖啡 × 2.*單價 45 元，小計 90 元/).waitFor()
+  await detail.getByText(/燕麥餅乾 × 1.*單價 60 元，小計 60 元/).waitFor()
+  assert.match((await detail.locator('ol').nth(0).innerText()).replace(/\s+/g, ' '), /待付款/)
+  assert.deepEqual(
+    (await detail.locator('ol').nth(1).locator('li').allTextContents())
+      .map((text) => text.replace(/\s+/g, ' ').trim().split(' · ')[0]),
+    ['保留 濾掛咖啡 × 2', '保留 燕麥餅乾 × 1'],
+  )
+  await expectOrderLayout(page)
+
+  // 以台北日期區間、狀態及單號篩選，避免歷史資料影響結果數量。
+  const dateParts = Object.fromEntries(new Intl.DateTimeFormat('en', {
+    timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date(replayedOrder.createdAt)).map(({ type, value }) => [type, value]))
+  const fromDate = `${dateParts.year}-${dateParts.month}-${dateParts.day}`
+  const nextDate = new Date(Date.UTC(Number(dateParts.year), Number(dateParts.month) - 1, Number(dateParts.day) + 1))
+  const toDate = [nextDate.getUTCFullYear(), String(nextDate.getUTCMonth() + 1).padStart(2, '0'),
+    String(nextDate.getUTCDate()).padStart(2, '0')].join('-')
+  await page.getByLabel('訂單編號', { exact: true }).fill(String(orderId))
+  await page.getByLabel('訂單狀態', { exact: true }).selectOption('awaiting_payment')
+  await page.getByLabel('建立起日（含）', { exact: true }).fill(fromDate)
+  await page.getByLabel('建立迄日（不含）', { exact: true }).fill(toDate)
+  await page.getByRole('button', { name: '套用篩選', exact: true }).click()
+  const orderList = page.getByRole('list', { name: '訂單查詢結果' })
+  await orderList.getByRole('button', { name: `查看訂單 #${orderId}`, exact: true }).waitFor()
+  assert.deepEqual(
+    (await orderList.getByRole('button').allTextContents()).map((text) => text.trim()),
+    [`查看訂單 #${orderId}`],
+  )
+  const viewOrder = orderList.getByRole('button', { name: `查看訂單 #${orderId}`, exact: true })
+  // 從篩選按鈕以 Tab 經過清除控制項，讓查詢結果按鈕取得鍵盤焦點。
+  await page.keyboard.press('Tab')
+  await page.keyboard.press('Tab')
+  // 確認鍵盤聚焦的原生查詢按鈕顯示可見外框。
+  assert.equal(await viewOrder.evaluate((button) => (
+    button === document.activeElement
+      && button.matches(':focus-visible')
+      && getComputedStyle(button).outlineStyle === 'solid'
+  )), true)
+  await viewOrder.press('Enter')
+  const orderHeading = page.getByRole('heading', { name: `訂單 #${orderId}`, exact: true })
+  await orderHeading.waitFor()
+  // 開啟詳情後確認焦點移至訂單標題，並保留可見外框。
+  assert.equal(await orderHeading.evaluate((heading) => heading === document.activeElement), true)
+  assert.equal(await orderHeading.evaluate((heading) => (
+    heading.matches(':focus-visible') && getComputedStyle(heading).outlineStyle === 'solid'
+  )), true)
+
+  // 取消後回讀同一訂單與庫存，確認歷程加入取消及釋放紀錄。
+  await page.getByRole('button', { name: '取消訂單', exact: true }).click()
+  await page.getByRole('status').filter({ hasText: '已取消訂單。' }).waitFor()
+  await detail.getByText('已取消', { exact: true }).waitFor()
+  assert.deepEqual(
+    (await detail.locator('ol').nth(0).locator('li').allTextContents())
+      .map((text) => text.replace(/\s+/g, ' ').trim().split(' · ')[0]),
+    ['待付款', '已取消'],
+  )
+  assert.deepEqual(
+    (await detail.locator('ol').nth(1).locator('li').allTextContents())
+      .map((text) => text.replace(/\s+/g, ' ').trim().split(' · ')[0]),
+    [
+      '保留 濾掛咖啡 × 2', '保留 燕麥餅乾 × 1',
+      '釋放 濾掛咖啡 × 2', '釋放 燕麥餅乾 × 1',
+    ],
+  )
+  await expectInventoryBalances(page, 12, 12, 3, 3)
 
   // 確認主要流程沒有未捕捉的頁面例外。
   phase = '確認頁面執行狀態'
   assert.deepEqual(pageErrors, [])
-  console.log('PASS：登入、登出、重載、總部及兩店庫存、鍵盤焦點與手機版面。')
+  console.log('PASS：登入、登出、重載、總部及兩店庫存、訂單重送／查詢／取消、焦點與手機版面。')
 } catch (error) {
   // Playwright 的動作紀錄可能包含欄位值，印出診斷前先遮蔽所有測試密碼。
   let diagnostic = error instanceof Error ? error.message : '未知錯誤'

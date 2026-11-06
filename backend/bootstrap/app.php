@@ -6,6 +6,7 @@ use App\Http\Middleware\EnforceSessionLifetime;
 use App\Http\Middleware\LimitRequestBody;
 use App\Http\Middleware\RequireCsrfToken;
 use Illuminate\Auth\AuthenticationException;
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Auth\Middleware\AuthenticatesRequests;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
@@ -18,6 +19,10 @@ use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(web: __DIR__ . '/../routes/web.php', health: '/up')
+    // 每分鐘清理已到期的訂單；庫存讀取及開單仍各自即時檢查到期。
+    ->withSchedule(function (Schedule $schedule): void {
+        $schedule->command('store-ordering:expire-orders')->everyMinute();
+    })
     // 讓 API 沿用 web session，並於授權前檢查會話期限。
     ->withMiddleware(function (Middleware $middleware): void {
         // 本文過大時不執行任何路由行為。

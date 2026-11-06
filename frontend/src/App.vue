@@ -163,6 +163,8 @@ onUnmounted(() => lifetime.abort())
       v-else
       :key="session.user.id"
       :role="session.user.role"
+      :actor-id="session.user.id"
+      :csrf-token="session.csrfToken"
       @logout="changeSession('logout')"
       @session-expired="refreshSession('expired')"
     />

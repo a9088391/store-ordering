@@ -157,6 +157,68 @@ th:first-child {
   margin-top: 1rem;
 }
 
+/* 訂單維持單欄閱讀，控制項可折行，品名與大金額保留在容器內。 */
+.order-panel {
+  margin-top: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.order-section {
+  display: grid;
+  justify-items: start;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  border-top: 1px solid #d6dce5;
+  padding-top: 1rem;
+}
+
+.order-section :is(h3, h4, dl, ul, ol) {
+  margin: 0;
+}
+
+.order-form,
+.order-form fieldset,
+.order-line {
+  display: grid;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.order-form {
+  width: min(100%, 24rem);
+}
+
+.order-form fieldset {
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px solid #d6dce5;
+}
+
+.order-form button {
+  justify-self: start;
+}
+
+.order-line,
+.order-list li + li {
+  margin-top: 0.5rem;
+}
+
+.order-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.order-list {
+  padding: 0;
+  list-style: none;
+}
+
+.order-summary dd {
+  margin: 0 0 0.5rem;
+}
+
 @media (max-width: 480px) {
   .shell {
     margin-block: 1.5rem;
