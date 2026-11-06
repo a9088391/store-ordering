@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+# 只在暫存 checkout 執行，所有 Docker 指令都由本地替身攔截。
+scratch="$(mktemp -d)"
+operation_pid=
+# 即使斷言失敗，也先讓被阻擋的 Docker 替身離開，再刪除暫存檔。
+cleanup() {
+    if [ -n "$operation_pid" ]; then
+        touch "$scratch/release"
+        wait "$operation_pid" || true
+    fi
+    rm -r -- "$scratch"
+}
+trap cleanup EXIT
+mkdir -p "$scratch/bin" "$scratch/.local/test" "$scratch/other/bin"
+cp "$(dirname -- "${BASH_SOURCE[0]}")/local" "$scratch/bin/local"
+cp "$scratch/bin/local" "$scratch/other/bin/local"
+cd -P -- "$scratch"
+export PATH="$PWD/bin:$PATH" DOCKER_HOST=unix:///reset-test.sock DOCKER_CONTEXT=
+export RESET_TEST_LOG="$PWD/docker.log" RESET_TEST_ROOT="$PWD"
+touch .local/test/runtime.env .local/test/mock-payment.env \
+    .local/test/accounts.json .local/test/payment-notifications.env
+cat > bin/docker <<'DOCKER'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "${*//$'\n'/ }" >> "$RESET_TEST_LOG"
+case "$1 $2" in
+    'volume ls')
+        if [ "$RESET_TEST_CASE" != success ] || ! grep -Fxq 'volume rm store-ordering-test_postgres-data' "$RESET_TEST_LOG"; then
+            printf 'store-ordering-test_postgres-data\n'
+        fi
+        ;;
+    'volume inspect')
+        if [ "$RESET_TEST_CASE" = foreign_volume ]; then
+            printf 'another-project|postgres-data|local|0\n'
+        else
+            printf 'store-ordering-test|postgres-data|local|0\n'
+        fi
+        ;;
+    'ps -aq')
+        if [ "$4" = volume=store-ordering-test_postgres-data ] && [ "$RESET_TEST_CASE" = attached_volume ]; then
+            printf 'other-db\n'
+        elif [ "$RESET_TEST_CASE" = foreign_container ] || [ "$RESET_TEST_CASE" = wrong_mount ]; then
+            printf 'fixture-db\n'
+        fi
+        ;;
+    'container inspect')
+        if [ "$RESET_TEST_CASE" = foreign_container ]; then
+            printf '/other-checkout|/other-checkout/compose.yaml\n'
+        else
+            printf '%s|%s/compose.yaml|another-volume\n' "$PWD" "$PWD"
+        fi
+        ;;
+    'run --pull')
+        digest="$(openssl dgst -sha256 -r < "$RESET_TEST_ROOT/.local/test/runtime.env")"
+        case "$RESET_TEST_CASE" in
+            foreign_stopped) printf '/other-checkout|%s\n' "${digest%% *}" ;;
+            wrong_runtime) printf '%s|%064d\n' "$RESET_TEST_ROOT" 0 ;;
+            unregistered_volume) ;;
+            unreadable_volume) exit 1 ;;
+            *) printf '%s|%s\n' "$RESET_TEST_ROOT" "${digest%% *}" ;;
+        esac
+        ;;
+    'compose -f')
+        case " $* " in
+            *' config --images db ') printf 'postgres:fixture\n' ;;
+            *' restart ')
+                [ "$RESET_TEST_CASE" = signal ]
+                touch "$RESET_TEST_ROOT/blocked"
+                while [ ! -e "$RESET_TEST_ROOT/release" ]; do sleep 0.02; done
+                ;;
+            *' build app ')
+                if [ "$RESET_TEST_CASE" = failed_build ]; then
+                    printf '測試建置失敗\n' >&2
+                    exit 9
+                fi
+                ;;
+            *' down ') ;;
+            *)
+                [ "$RESET_TEST_CASE" = success ]
+                grep -Fxq 'volume rm store-ordering-test_postgres-data' "$RESET_TEST_LOG"
+                ;;
+        esac
+        ;;
+    'volume rm')
+        [ "$3" = store-ordering-test_postgres-data ]
+        grep -Eq ' down$' "$RESET_TEST_LOG"
+        if [ "$RESET_TEST_CASE" = failed_remove ]; then
+            printf '測試資料卷清除失敗\n' >&2
+            exit 9
+        fi
+        [ "$RESET_TEST_CASE" = success ]
+        ;;
+    'info --format') printf 'test-server\n' ;;
+    *)
+        printf '不應執行 Docker 操作：%s\n' "$*" >&2
+        exit 90
+        ;;
+esac
+DOCKER
+chmod 700 bin/docker
+
+# 拒絕時檢查終態、資料仍在，並驗證 Docker 只收到精確目標的唯讀查詢。
+reject() {
+    local case_name="$1" answer="$2" expected="$3" call
+    local mount='type=volume,source=store-ordering-test_postgres-data,target=/var/lib/postgresql,readonly,volume-nocopy'
+    : > "$RESET_TEST_LOG"
+    if printf '%s' "$answer" | RESET_TEST_CASE="$case_name" bin/local test reset > reset.log 2>&1; then
+        printf '重設應遭拒絕：%s\n' "$case_name" >&2
+        return 1
+    fi
+    grep -Fq '127.0.0.1:8011' reset.log
+    grep -Fxq -- "工作目錄：$PWD" reset.log
+    grep -Fq 'store-ordering-test_postgres-data' reset.log
+    grep -Fq -- "$expected" reset.log
+    test -f .local/test/accounts.json
+    test -f .local/test/payment-notifications.env
+    test ! -e /tmp/store-ordering-test.local.lock
+    if [ "$case_name" = no_confirmation ]; then
+        test ! -s "$RESET_TEST_LOG"
+    else
+        test -s "$RESET_TEST_LOG"
+        while IFS= read -r call; do
+            case "$call" in
+                'volume ls --quiet --filter name=store-ordering-test_postgres-data' \
+                |'volume inspect store-ordering-test_postgres-data --format '* \
+                |'ps -aq --filter label=com.docker.compose.project=store-ordering-test' \
+                |'container inspect fixture-db --format '* \
+                |'compose -f compose.yaml -p store-ordering-test '*' config --images db' \
+                |'run --pull '*" --rm --network none --read-only --user postgres --mount $mount "*)
+                    ;;
+                *)
+                    printf '拒絕時出現非預期 Docker 指令：%s\n' "$call" >&2
+                    return 1
+                    ;;
+            esac
+        done < "$RESET_TEST_LOG"
+    fi
+}
+
+CDPATH="$PWD/other" reject no_confirmation '' '已取消重設'
+reject no_confirmation $'\n' '已取消重設'
+reject no_confirmation $'reset store-ordering\n' '已取消重設'
+reject foreign_volume $'reset store-ordering-test\n' '拒絕使用歸屬或儲存方式不符的 volume'
+reject foreign_container $'reset store-ordering-test\n' '拒絕使用歸屬或掛載不符的 Compose 容器'
+reject wrong_mount $'reset store-ordering-test\n' '拒絕使用歸屬或掛載不符的 Compose 容器'
+reject foreign_stopped $'reset store-ordering-test\n' '無法核對資料卷歸屬'
+reject wrong_runtime $'reset store-ordering-test\n' '無法核對資料卷歸屬'
+reject unregistered_volume $'reset store-ordering-test\n' '無法核對資料卷歸屬'
+reject unreadable_volume $'reset store-ordering-test\n' '無法讀取資料卷歸屬'
+
+# 普通 up 也須先拒絕外來的容器、不同設定或無法讀取的標記，才可異動服務。
+for case_name in foreign_container wrong_runtime unreadable_volume; do
+    : > "$RESET_TEST_LOG"
+    if RESET_TEST_CASE="$case_name" bin/local test up > up.log 2>&1; then exit 1; fi
+    grep -Fq '歸屬' up.log
+    ! grep -Eq ' build app$| stop | up ' "$RESET_TEST_LOG" || exit 1
+done
+
+# 前景 Docker 子命令被測試閂鎖阻擋時，另一個 checkout 必須仍無法取得鎖。
+RESET_TEST_CASE=signal bin/local test restart > signal.log 2>&1 &
+operation_pid=$!
+for ((attempt=0; attempt<100; attempt++)); do
+    [ ! -e "$scratch/blocked" ] || break
+    sleep 0.02
+done
+test -e "$scratch/blocked"
+kill -TERM "$operation_pid"
+if RESET_TEST_CASE=signal_probe "$scratch/other/bin/local" test restart > locked.log 2>&1; then
+    exit 1
+fi
+grep -Fq '無法鎖定' locked.log
+touch "$scratch/release"
+if wait "$operation_pid"; then exit 1; else [ "$?" -eq 143 ]; fi
+operation_pid=
+
+# 預先建置失敗、或停止後仍有掛載時，都應保留帳密與 volume。
+for case_name in failed_build attached_volume; do
+    : > "$RESET_TEST_LOG"
+    if printf 'reset store-ordering-test\n' | RESET_TEST_CASE="$case_name" bin/local test reset > reset.log 2>&1; then
+        exit 1
+    fi
+    test -f .local/test/accounts.json
+    test -f .local/test/payment-notifications.env
+    ! grep -Eq '^volume rm ' "$RESET_TEST_LOG" || exit 1
+    if [ "$case_name" = failed_build ]; then
+        grep -Fq '測試建置失敗' reset.log
+        ! grep -Eq ' down$' "$RESET_TEST_LOG" || exit 1
+    else
+        grep -Fq '仍有容器掛載' reset.log
+    fi
+done
+
+# 清除失敗後，普通 up 必須拒絕使用仍存在的舊資料庫啟動。
+if printf 'reset store-ordering-test\n' | RESET_TEST_CASE=failed_remove bin/local test reset > reset.log 2>&1; then
+    exit 1
+fi
+grep -Fq '測試資料卷清除失敗' reset.log
+test ! -e .local/test/accounts.json
+test ! -e .local/test/payment-notifications.env
+test ! -e /tmp/store-ordering-test.local.lock
+if RESET_TEST_CASE=failed_remove bin/local test up > up.log 2>&1; then
+    exit 1
+fi
+grep -Fq '請先復原 .local/test/accounts.json' up.log
+
+# 確認後以替身核對停機、清除、初始化及上線順序，並檢查新私密檔已生成。
+: > "$RESET_TEST_LOG"
+printf 'reset store-ordering-test\n' | RESET_TEST_CASE=success bin/local test reset > reset.log 2>&1
+awk '
+    / down$/ { if (step != 0) exit 1; step = 1 }
+    /^volume rm store-ordering-test_postgres-data$/ { if (step != 1) exit 1; step = 2 }
+    / up -d --wait db$/ { if (step != 2) exit 1; step = 3 }
+    /db bash \/opt\/store-ordering\/init-db.sh$/ { if (step != 3) exit 1; step = 4 }
+    /app php artisan migrate --force$/ { if (step != 4) exit 1; step = 5 }
+    /mock-payment php artisan migrate --force/ { if (step != 5) exit 1; step = 6 }
+    /php artisan store-ordering:seed-demo/ { if (step != 6) exit 1; step = 7 }
+    /up -d --wait --no-build --pull never app scheduler/ { if (step != 7) exit 1; step = 8 }
+    END { if (step != 8) exit 1 }
+' "$RESET_TEST_LOG"
+grep -Fq '網站 http://127.0.0.1:8011，初始帳密 .local/test/accounts.json' reset.log
+grep -Fq 'hq@example.test' .local/test/accounts.json
+grep -Eq '^STORE_ORDERING_PAYMENT_HMAC_KEY=[0-9a-f]{64}$' .local/test/payment-notifications.env
+test ! -e /tmp/store-ordering-test.local.lock
+printf '確認、目標保護、中斷復原與重設順序測試通過。\n'

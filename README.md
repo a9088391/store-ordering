@@ -40,6 +40,20 @@
 
 `restart` 重啟網站、模擬金流、兩個排程器與 PostgreSQL，仍會處理先前排入的通知。`down` 停止並移除本案容器，保留 PostgreSQL volume。再次執行 `up` 會使用原有資料與帳密，適用於修改程式後重建。請一次執行一個啟動命令。若初始化中斷且 PostgreSQL 仍可啟動，使用原有設定重跑 `up` 可補齊缺少的角色及資料庫。角色權限或資料庫擁有者不符時，啟動會停止，請先檢查既有設定。
 
+### 重設示範資料
+
+```sh
+./bin/local demo reset
+```
+
+先核對畫面上的工作目錄、Docker socket、Compose 專案、網站、資料庫及 volume，再輸入 `reset store-ordering`。直接按 Enter、關閉輸入或輸入其他文字會取消。測試模式使用 `./bin/local test reset`，確認文字是 `reset store-ordering-test`，清除的測試 volume 也包含 PHPUnit 資料庫。
+
+重設會先停止並移除該模式的容器，再清除該模式的 PostgreSQL volume。沒有備份就無法還原訂單、庫存異動、付款歷程和待辦。完成後，網站會以初始商品和庫存重新啟動。從該模式的 `.local/<mode>/accounts.json` 取得新密碼並重新登入。舊 session 失效，新的簽章金鑰會拒絕使用舊金鑰送達的通知。
+
+既有資料卷若尚未登記，請先用原工作目錄與原私密設定執行同模式的 `up`。初始化成功後會記錄歸屬。容器移除後，仍能透過工作目錄與私密設定指紋核對資料卷。
+
+重設途中若失敗，請先閱讀錯誤。若新資料卷已建立但尚未登記，使用同模式的 `up` 補完初始化；其他重設失敗可重跑同模式的 `reset`。若程序被強制終止並留下 `/tmp/store-ordering.local.lock` 或 `/tmp/store-ordering-test.local.lock`，先確認原命令及其 Docker 子程序都已結束，再以 `rmdir` 移除該模式的鎖目錄。若要還原重設前的環境，須使用同一時間點的 volume 與私密設定備份。
+
 ## 開發與驗證
 
 - `backend/routes/web.php` 註冊同源 JSON API。登入與登出要帶 `GET /api/session` 回傳的 `csrfToken`，以 `X-CSRF-TOKEN` 送出。登入和登出回應會提供新的 token。
@@ -76,6 +90,8 @@
 (cd frontend && npm ci && npm run test:browser)
 ./bin/local test down
 ```
+
+可先執行 `bash bin/test-reset-guards` 檢查確認與目標保護。該測試使用臨時設定及模擬的 Docker 指令。
 
 測試網站為 `http://127.0.0.1:8011`，瀏覽器帳密由 `.local/test/accounts.json` 提供。PHPUnit 透過 Laravel HTTP 測試入口使用測試專案內的 `store_ordering_phpunit`。實際 HTTP 和瀏覽器使用同一測試專案內獨立的 `store_ordering_test`。
 

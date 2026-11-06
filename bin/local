@@ -2,8 +2,14 @@
 set -euo pipefail
 umask 077
 
+# 模式及操作都由固定清單選擇，避免將外部名稱交給 Docker。
+usage() {
+    printf '用法：bin/local {demo|test} {up|restart|down|ps|phpunit|reset}\n' >&2
+    exit 2
+}
+
 # 固定專案、資料庫與對外埠，讓展示和自動化測試有各自的 Compose 資源。
-cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 case "${1:-}" in
     demo)
         project=store-ordering
@@ -18,16 +24,21 @@ case "${1:-}" in
         export STORE_ORDERING_SESSION_COOKIE=store_ordering_test_session
         ;;
     *)
-        printf '用法：bin/local {demo|test} {up|restart|down|ps|phpunit}\n' >&2
-        exit 2
+        usage
         ;;
 esac
 local_dir=".local/$1"
+volume="${project}_postgres-data"
+volume_owner=/var/lib/postgresql/.store-ordering-owner
+accounts="$local_dir/accounts.json"
+mock_env="$local_dir/mock-payment.env"
+notification_env="$local_dir/payment-notifications.env"
 command="${2:-}"
-if [ "$#" -ne 2 ]; then
-    printf '用法：bin/local {demo|test} {up|restart|down|ps|phpunit}\n' >&2
-    exit 2
-fi
+[ "$#" -eq 2 ] || usage
+case "$command" in
+    up|restart|down|ps|phpunit|reset) ;;
+    *) usage ;;
+esac
 
 # 確認 Docker 指令只使用本機 Unix socket，避免把建置內容或私密掛載送往遠端。
 if [ -n "${DOCKER_CONTEXT:-}" ] || [ -z "${DOCKER_HOST:-}" ]; then
@@ -43,22 +54,79 @@ case "$endpoint" in
         ;;
 esac
 
+# 固定已核對的 socket，避免處理途中切換 Docker context 時改用其他引擎。
+unset DOCKER_CONTEXT
+export DOCKER_HOST="$endpoint"
+
+# 確認字串綁定模式，空白、EOF、錯字與另一模式都不會啟動容器或改動私密檔。
+if [ "$command" = reset ]; then
+    printf '重設目標：%s，http://127.0.0.1:%s\n' "$project" "$STORE_ORDERING_PORT"
+    printf '工作目錄：%s\nDocker：%s\n' "$PWD" "$endpoint"
+    printf '將清除 Docker volume %s，包含資料庫 %s、%s' \
+        "$volume" "$STORE_ORDERING_DATABASE" "$STORE_ORDERING_MOCK_PAYMENT_DATABASE"
+    if [ "$project" = store-ordering-test ]; then
+        printf '、store_ordering_phpunit'
+    fi
+    printf '。\n將重建 %s 與 %s。沒有備份就無法還原。\n' "$accounts" "$notification_env"
+    printf '請輸入「reset %s」確認：\n' "$project"
+    if ! IFS= read -r confirmation || [ "$confirmation" != "reset $project" ]; then
+        printf '已取消重設。\n' >&2
+        exit 1
+    fi
+fi
+
+# 私密檔只接受本案的正常檔案；拒絕連結或目錄，避免初始化與重設碰到其他位置。
+if [ -L .local ] || [ -L "$local_dir" ]; then
+    printf '拒絕以符號連結存放本機設定。\n' >&2
+    exit 1
+fi
+for file in "$local_dir/runtime.env" "$accounts" "$mock_env" "$notification_env"; do
+    if [[
+        -L "$file"
+        || ( -e "$file" && ! -f "$file" )
+    ]]; then
+        printf '拒絕使用非一般檔案的本機設定：%s\n' "$file" >&2
+        exit 1
+    fi
+done
+
+# Compose 專案名稱在本機共用，操作鎖也要跨 checkout，避免先核對後被另一個啟動取代。
+if [ "$command" != ps ]; then
+    lock="/tmp/$project.local.lock"
+    if ! mkdir -- "$lock"; then
+        printf '無法鎖定 %s，請確認該模式沒有其他操作。\n' "$lock" >&2
+        exit 1
+    fi
+    # 收到訊號時先等待前景 Docker 命令結束，才由 EXIT 釋放操作鎖。
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'rmdir -- "$lock"' EXIT
+fi
+
 # 讓私密值一律來自本模式的檔案，避免 Compose 優先套用外部 shell 的同名變數。
 unset STORE_ORDERING_APP_KEY STORE_ORDERING_DB_PASSWORD STORE_ORDERING_POSTGRES_PASSWORD
 unset STORE_ORDERING_MOCK_PAYMENT_DB_PASSWORD STORE_ORDERING_PAYMENT_HMAC_KEY
-compose=(docker compose -f compose.yaml -p "$project" --env-file "$local_dir/runtime.env")
-mock_env="$local_dir/mock-payment.env"
-notification_env="$local_dir/payment-notifications.env"
-if [ -L "$mock_env" ] || [ -L "$notification_env" ]; then
-    printf '拒絕以符號連結存放模擬金流或通知設定。\n' >&2
-    exit 1
-fi
-if [ -f "$mock_env" ]; then
-    compose+=(--env-file "$mock_env")
-fi
-if [ -f "$notification_env" ]; then
-    compose+=(--env-file "$notification_env")
-fi
+
+# 每次從目前存在的私密檔組裝參數，重設後只載入新一代的通知金鑰。
+configure_compose() {
+    compose=(docker compose -f compose.yaml -p "$project" --env-file "$local_dir/runtime.env")
+    if [ -f "$mock_env" ]; then
+        compose+=(--env-file "$mock_env")
+    fi
+    if [ -f "$notification_env" ]; then
+        compose+=(--env-file "$notification_env")
+    fi
+}
+
+# 用清單區分「尚未建立」與 Docker 查詢失敗，避免誤用新憑證啟動舊資料。
+find_volume() {
+    local candidates
+    candidates="$(docker volume ls --quiet --filter "name=$volume")" || return 1
+    if grep -Fxq -- "$volume" <<< "$candidates"; then
+        printf '%s\n' "$volume"
+    fi
+}
 
 # 原子建立權限為 0600 的檔案，重跑時沿用既有值，避免密鑰或密碼中途被覆寫。
 write_private_file() {
@@ -79,24 +147,17 @@ write_private_file() {
     rm -f -- "$temporary"
 }
 
-# 啟動前核對私密檔案位置；已有資料庫時，缺少執行密鑰需由本機備份復原。
+# 已有資料庫時，缺少執行密鑰需由本機備份復原。
 prepare_runtime() {
-    local app_key db_password postgres_password
-    # 私密目錄與檔案需在專案內，並限制為目前使用者可讀。
-    if [[
-        -L .local
-        || -L "$local_dir"
-        || -L "$local_dir/runtime.env"
-    ]]; then
-        printf '拒絕以符號連結存放本機設定。\n' >&2
-        return 1
-    fi
+    local app_key db_password postgres_password existing_volume runtime_digest
+    # 私密目錄限目前使用者讀取。
     mkdir -p -- "$local_dir"
     chmod 700 .local "$local_dir"
 
     # 只有資料庫尚未初始化時才能產生新密鑰與連線密碼。
     if [ ! -f "$local_dir/runtime.env" ]; then
-        if docker volume inspect "${project}_postgres-data" >/dev/null 2>&1; then
+        existing_volume="$(find_volume)"
+        if [ -n "$existing_volume" ]; then
             printf '本案資料庫已存在，請先復原 %s/runtime.env。\n' "$local_dir" >&2
             return 1
         fi
@@ -110,18 +171,19 @@ prepare_runtime() {
             "STORE_ORDERING_POSTGRES_PASSWORD=$postgres_password")"
     fi
     chmod 600 "$local_dir/runtime.env"
+
+    # 路徑可能被另一份安裝重用，指紋只用來核對同一份私密設定，避免暴露原文。
+    runtime_digest="$(openssl dgst -sha256 -r < "$local_dir/runtime.env")"
+    volume_identity="$PWD|${runtime_digest%% *}"
 }
 
 # 產生三個示範密碼；檔案只在初始化的單次容器中以唯讀方式掛載。
 prepare_accounts() {
-    local hq taipei taichung
-    # 拒絕跟隨符號連結，缺檔且已有資料時要求還原既有帳密。
-    if [ -L "$local_dir/accounts.json" ]; then
-        printf '拒絕以符號連結存放示範密碼。\n' >&2
-        return 1
-    fi
-    if [ ! -f "$local_dir/accounts.json" ]; then
-        if docker volume inspect "${project}_postgres-data" >/dev/null 2>&1; then
+    local hq taipei taichung existing_volume
+    # 缺檔且已有資料時要求還原既有帳密。
+    if [ ! -f "$accounts" ]; then
+        existing_volume="$(find_volume)"
+        if [ -n "$existing_volume" ]; then
             printf '本案資料庫已存在，請先復原 %s/accounts.json。\n' "$local_dir" >&2
             return 1
         fi
@@ -129,19 +191,20 @@ prepare_accounts() {
         hq="$(openssl rand -hex 18)"
         taipei="$(openssl rand -hex 18)"
         taichung="$(openssl rand -hex 18)"
-        write_private_file "$local_dir/accounts.json" "$(printf \
+        write_private_file "$accounts" "$(printf \
             '{"hq@example.test":"%s","taipei@example.test":"%s","taichung@example.test":"%s"}' \
             "$hq" "$taipei" "$taichung")"
     fi
-    chmod 600 "$local_dir/accounts.json"
+    chmod 600 "$accounts"
 }
 
 # 既有環境只在尚無模擬金流角色時新增密碼，遺失的既有憑證須先復原。
 prepare_mock_password() {
-    local role_exists mock_password
+    local role_exists mock_password existing_volume
     if [ ! -f "$mock_env" ]; then
         # 第 02 票的資料庫可安全補建；確認既有角色是否存在，避免建立錯誤的替代密碼。
-        if docker volume inspect "${project}_postgres-data" >/dev/null 2>&1; then
+        existing_volume="$(find_volume)"
+        if [ -n "$existing_volume" ]; then
             "${compose[@]}" up -d --wait db
             role_exists="$("${compose[@]}" exec -T --user postgres db psql --no-psqlrc --tuples-only \
                 --no-align --username postgres --dbname postgres --set=ON_ERROR_STOP=1 \
@@ -165,7 +228,6 @@ prepare_notification_key() {
     if [ ! -f "$notification_env" ]; then
         key="$(openssl rand -hex 32)"
         write_private_file "$notification_env" "STORE_ORDERING_PAYMENT_HMAC_KEY=$key"
-        compose+=(--env-file "$notification_env")
     fi
 
     # 僅在金鑰完整且可限制存取時啟動，錯誤訊息不顯示內容。
@@ -177,29 +239,153 @@ prepare_notification_key() {
     chmod 600 "$notification_env"
 }
 
+# 遷移及播種成功後才讓網站與排程器接觸本次資料。
+start_services() {
+    # 核對並補齊本案資源，避免首次初始化中斷後留下半套環境。
+    prepare_mock_password
+    "${compose[@]}" up -d --wait db
+    "${compose[@]}" exec -T --user postgres db bash /opt/store-ordering/init-db.sh
+    "${compose[@]}" run --rm -T --no-deps app php artisan migrate --force
+    "${compose[@]}" run --rm -T --no-deps --pull never mock-payment \
+        php artisan migrate --force --path=database/mock-payment-migrations
+
+    # macOS 的 0600 帳密檔只由單次初始化容器以唯讀方式載入。
+    "${compose[@]}" run --rm -T --no-deps --user root \
+        -v "$PWD/$accounts:/setup/accounts.json:ro" \
+        app php artisan store-ordering:seed-demo /setup/accounts.json
+
+    # 應用程式成功連線並播種後，才以原子連結記錄歸屬；已有標記不能改寫。
+    "${compose[@]}" exec -T --user postgres db sh -eu -c '
+        if [ ! -L "$1" ]; then
+            ln -sT -- "$2" "$1"
+        fi
+        if [ "$(readlink -- "$1")" != "$2" ]; then
+            printf "資料卷已綁定其他安裝。\n" >&2
+            exit 1
+        fi
+    ' sh "$volume_owner" "$volume_identity"
+    "${compose[@]}" up -d --wait --no-build --pull never app scheduler mock-payment mock-payment-scheduler
+    printf '網站 http://127.0.0.1:%s，初始帳密 %s\n' "$STORE_ORDERING_PORT" "$accounts"
+}
+
+# 啟動或清除前核對資料卷與安裝歸屬；只有普通 up 能以原憑證登記舊資料卷。
+find_owned_volume() {
+    local target owner image registered_identity
+    target="$(find_volume)" || return 1
+    [ -n "$target" ] || return 0
+    owner="$(docker volume inspect "$target" --format \
+        '{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.volume"}}|{{.Driver}}|{{len .Options}}')" || return 1
+    if [ "$owner" != "$project|postgres-data|local|0" ]; then
+        printf '拒絕使用歸屬或儲存方式不符的 volume：%s\n' "$volume" >&2
+        return 1
+    fi
+
+    # 用現有資料庫映像唯讀讀取標記，避免為了核對而啟動 PostgreSQL 或連上網路。
+    image="$("${compose[@]}" config --images db)" || return 1
+    if ! registered_identity="$(docker run --pull missing --rm --network none --read-only --user postgres \
+        --mount "type=volume,source=$target,target=/var/lib/postgresql,readonly,volume-nocopy" \
+        --entrypoint /bin/sh "$image" -eu -c '
+            # 目錄可讀且標記確實不存在時，才視為尚未登記。
+            if [ ! -r /var/lib/postgresql ] || [ ! -x /var/lib/postgresql ]; then
+                exit 1
+            fi
+            if [ -L "$1" ]; then
+                readlink -- "$1"
+            elif [ -e "$1" ]; then
+                exit 1
+            fi
+        ' sh "$volume_owner")"; then
+        printf '無法讀取資料卷歸屬：%s。\n' "$target" >&2
+        return 1
+    fi
+    if [[
+        "$registered_identity" != "$volume_identity"
+        && ( -n "$registered_identity" || ${1:-} != allow-unregistered )
+    ]]; then
+        printf '無法核對資料卷歸屬：%s。請核對原工作目錄及私密設定。\n' "$target" >&2
+        return 1
+    fi
+    printf '%s\n' "$target"
+}
+
+# 異動服務前核對同專案名的容器來自本 checkout，避免影響其他 checkout。
+verify_project_containers() {
+    local containers id target format
+    format='{{index .Config.Labels "com.docker.compose.project.working_dir"}}|'
+    format+='{{index .Config.Labels "com.docker.compose.project.config_files"}}'
+    format+='{{if eq (index .Config.Labels "com.docker.compose.service") "db"}}|'
+    format+='{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Name}}{{end}}{{end}}{{end}}'
+    containers="$(docker ps -aq --filter "label=com.docker.compose.project=$project")"
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        # 資料庫容器的實際掛載也要對應操作者看到的目標。
+        target="$(docker container inspect "$id" --format "$format")"
+        case "$target" in
+            "$PWD|$PWD/compose.yaml"|"$PWD|$PWD/compose.yaml|$volume") ;;
+            *)
+                printf '拒絕使用歸屬或掛載不符的 Compose 容器：%s\n' "$id" >&2
+                return 1
+                ;;
+        esac
+    done <<< "$containers"
+}
+
+# 重設沿用同一套初始化，先切斷舊處理，再讓新資料及通知金鑰一起上線。
+reset_local() {
+    local remaining reset_volume
+    # 建置先於停機及清除，讓建置錯誤保留整套舊環境。
+    verify_project_containers
+    prepare_runtime
+    find_owned_volume >/dev/null
+    "${compose[@]}" build app
+    "${compose[@]}" down
+    remaining="$(docker ps -aq --filter "label=com.docker.compose.project=$project")"
+    if [ -n "$remaining" ]; then
+        printf '本案仍有容器，已停止重設。\n' >&2
+        return 1
+    fi
+
+    # 確認資料卷未被其他容器掛載，避免在 volume 仍被使用時清除憑證。
+    reset_volume="$(find_owned_volume)"
+    if [ -n "$reset_volume" ]; then
+        remaining="$(docker ps -aq --filter "volume=$reset_volume")"
+        if [ -n "$remaining" ]; then
+            printf '仍有容器掛載 %s，已停止重設。\n' "$reset_volume" >&2
+            return 1
+        fi
+    fi
+
+    # 先移除帳密檔。若清除中斷且舊 volume 還在，普通 up 會拒絕初始化。
+    rm -f -- "$accounts"
+    rm -f -- "$notification_env"
+    if [ -n "$reset_volume" ]; then
+        docker volume rm "$reset_volume"
+    fi
+
+    # 新 volume 沒有舊 session、復原待辦或通知，新的簽章金鑰也會拒絕重播。
+    prepare_accounts
+    prepare_notification_key
+    configure_compose
+    start_services
+}
+
+configure_compose
 case "$command" in
     up)
-        # 資料庫完成遷移與冪等初始化後，才啟動網站與兩個排程器。
+        # 普通 up 先核對歸屬，再沿用原資料與私密設定執行遷移。
         docker info --format "{{.ServerVersion}}" >/dev/null
+        verify_project_containers
         prepare_runtime
+        find_owned_volume allow-unregistered >/dev/null
         prepare_accounts
         prepare_notification_key
+        configure_compose
         "${compose[@]}" build app
         "${compose[@]}" stop mock-payment-scheduler app scheduler mock-payment
-        prepare_mock_password
-        "${compose[@]}" up -d --wait db
-        # 每次 up 都核對並補齊本案資料庫資源，避免首次中斷留下半套環境。
-        "${compose[@]}" exec -T --user postgres db bash /opt/store-ordering/init-db.sh
-        "${compose[@]}" run --rm -T --no-deps app php artisan migrate --force
-        "${compose[@]}" run --rm -T --no-deps --pull never mock-payment \
-            php artisan migrate --force --path=database/mock-payment-migrations
-        # macOS 主機檔案屬於目前使用者，單次初始化沿用容器 root 讀取 0600 檔案。
-        "${compose[@]}" run --rm -T --no-deps --user root \
-            -v "$PWD/$local_dir/accounts.json:/setup/accounts.json:ro" \
-            app php artisan store-ordering:seed-demo /setup/accounts.json
-        "${compose[@]}" up -d --wait --no-build --pull never app scheduler mock-payment mock-payment-scheduler
-        printf '網站 http://127.0.0.1:%s，初始帳密 %s/accounts.json\n' \
-            "$STORE_ORDERING_PORT" "$local_dir"
+        start_services
+        ;;
+    reset)
+        reset_local
         ;;
     restart)
         "${compose[@]}" restart
@@ -216,9 +402,5 @@ case "$command" in
         fi
         "${compose[@]}" exec -T -e APP_ENV=testing -e DB_DATABASE=store_ordering_phpunit \
             app vendor/bin/phpunit --do-not-cache-result
-        ;;
-    *)
-        printf '用法：bin/local {demo|test} {up|restart|down|ps|phpunit}\n' >&2
-        exit 2
         ;;
 esac
