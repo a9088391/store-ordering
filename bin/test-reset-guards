@@ -39,6 +39,12 @@ case "$1 $2" in
             printf 'store-ordering-test|postgres-data|local|0\n'
         fi
         ;;
+    'ps --format')
+        case "$RESET_TEST_CASE" in
+            active_test) printf 'store-ordering-test\n' ;;
+            active_load) printf 'store-ordering-load-012345abcdef\n' ;;
+        esac
+        ;;
     'ps -aq')
         if [ "$4" = volume=store-ordering-test_postgres-data ] && [ "$RESET_TEST_CASE" = attached_volume ]; then
             printf 'other-db\n'
@@ -124,7 +130,8 @@ reject() {
         test -s "$RESET_TEST_LOG"
         while IFS= read -r call; do
             case "$call" in
-                'volume ls --quiet --filter name=store-ordering-test_postgres-data' \
+                'ps --format '* \
+                |'volume ls --quiet --filter name=store-ordering-test_postgres-data' \
                 |'volume inspect store-ordering-test_postgres-data --format '* \
                 |'ps -aq --filter label=com.docker.compose.project=store-ordering-test' \
                 |'container inspect fixture-db --format '* \
@@ -139,6 +146,28 @@ reject() {
         done < "$RESET_TEST_LOG"
     fi
 }
+
+# 負載模式的資料只能留存，錯誤識別和非負載模式的 benchmark 都不得觸及 Docker。
+: > "$RESET_TEST_LOG"
+for mode in demo test; do
+    if RESET_TEST_CASE=unexpected bin/local "$mode" benchmark > load.log 2>&1; then exit 1; fi
+    grep -Fq '用法' load.log
+done
+if RESET_TEST_CASE=unexpected bin/local load-ABCDEF012345 up > load.log 2>&1; then exit 1; fi
+grep -Fq '用法' load.log
+if RESET_TEST_CASE=unexpected bin/local load-012345abcdef reset > load.log 2>&1; then exit 1; fi
+grep -Fq '用法' load.log
+test ! -s "$RESET_TEST_LOG"
+
+# 另一個測試環境在執行時，負載模式在準備設定和啟動容器前即停止。
+if RESET_TEST_CASE=active_test bin/local load-012345abcdef up > load.log 2>&1; then exit 1; fi
+grep -Fq '請先停止 store-ordering-test' load.log
+test "$(wc -l < "$RESET_TEST_LOG")" -eq 1
+test ! -e .local/load-012345abcdef
+: > "$RESET_TEST_LOG"
+if RESET_TEST_CASE=active_load bin/local test up > load.log 2>&1; then exit 1; fi
+grep -Fq '請先停止 store-ordering-load-012345abcdef' load.log
+test "$(wc -l < "$RESET_TEST_LOG")" -eq 1
 
 CDPATH="$PWD/other" reject no_confirmation '' '已取消重設'
 reject no_confirmation $'\n' '已取消重設'

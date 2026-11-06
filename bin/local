@@ -5,6 +5,7 @@ umask 077
 # 模式及操作都由固定清單選擇，避免將外部名稱交給 Docker。
 usage() {
     printf '用法：bin/local {demo|test} {up|restart|down|ps|phpunit|reset}\n' >&2
+    printf '      bin/local load-<12 位十六進位小寫識別> {up|benchmark|ps|down}\n' >&2
     exit 2
 }
 
@@ -23,6 +24,14 @@ case "${1:-}" in
         export STORE_ORDERING_MOCK_PAYMENT_DATABASE=store_ordering_mock_payment_test
         export STORE_ORDERING_SESSION_COOKIE=store_ordering_test_session
         ;;
+    load-*)
+        [[ "$1" =~ ^load-[0-9a-f]{12}$ ]] || usage
+        project="store-ordering-$1"
+        export STORE_ORDERING_DATABASE=store_ordering_test STORE_ORDERING_PORT=8012
+        export STORE_ORDERING_MOCK_PAYMENT_DATABASE=store_ordering_mock_payment_test
+        export STORE_ORDERING_SESSION_COOKIE="store_ordering_load_${1#load-}_session"
+        export MOCK_PAYMENT_URL=http://mock-payment:8000
+        ;;
     *)
         usage
         ;;
@@ -36,8 +45,12 @@ notification_env="$local_dir/payment-notifications.env"
 command="${2:-}"
 [ "$#" -eq 2 ] || usage
 case "$command" in
-    up|restart|down|ps|phpunit|reset) ;;
+    up|restart|down|ps|phpunit|reset|benchmark) ;;
     *) usage ;;
+esac
+case "$project:$command" in
+    store-ordering-load-*:up|store-ordering-load-*:down|store-ordering-load-*:ps|store-ordering-load-*:benchmark) ;;
+    store-ordering-load-*:*|*:benchmark) usage ;;
 esac
 
 # 確認 Docker 指令只使用本機 Unix socket，避免把建置內容或私密掛載送往遠端。
@@ -92,7 +105,11 @@ done
 
 # Compose 專案名稱在本機共用，操作鎖也要跨 checkout，避免先核對後被另一個啟動取代。
 if [ "$command" != ps ]; then
+    # 一般測試與負載共用配額，兩種模式用同一把鎖協調啟動及驗收。
     lock="/tmp/$project.local.lock"
+    if [[ "$project" == store-ordering-load-* ]]; then
+        lock=/tmp/store-ordering-test.local.lock
+    fi
     if ! mkdir -- "$lock"; then
         printf '無法鎖定 %s，請確認該模式沒有其他操作。\n' "$lock" >&2
         exit 1
@@ -369,7 +386,40 @@ reset_local() {
     start_services
 }
 
+# 保留展示環境的既有配額，拒絕同時使用另一個隔離測試環境。
+verify_load_isolation() {
+    local running peer
+    running="$(docker ps --format '{{.Label "com.docker.compose.project"}}')"
+    while IFS= read -r peer; do
+        case "$peer" in
+            store-ordering-test|store-ordering-load-*)
+                if [ "$peer" != "$project" ]; then
+                    printf '此測試環境啟動或驗收前請先停止 %s。\n' "$peer" >&2
+                    return 1
+                fi
+                ;;
+        esac
+    done <<< "$running"
+}
+
+# 先讓負載程序排空並寫完證據，才由 EXIT 釋放測試環境操作鎖。
+stop_benchmark() {
+    trap '' HUP INT TERM
+    # 啟動子程序前也可能收到訊號，此時 $! 尚未設定。
+    if (set +u; [ -n "$!" ]); then
+        kill -TERM "$!" 2>/dev/null || true
+        wait "$!" || true
+    fi
+    exit "$1"
+}
+
 configure_compose
+# 測試與負載互相排除，以免和展示環境合計超過上限。
+if [ "$project" != store-ordering ]; then
+    case "$command" in
+        up|restart|reset|benchmark) verify_load_isolation ;;
+    esac
+fi
 case "$command" in
     up)
         # 普通 up 先核對歸屬，再沿用原資料與私密設定執行遷移。
@@ -392,7 +442,26 @@ case "$command" in
         "${compose[@]}" start --wait --wait-timeout 60
         ;;
     down|ps)
+        if [[ "$project" == store-ordering-load-* && "$command" == down ]]; then
+            verify_project_containers
+        fi
         "${compose[@]}" "$command"
+        ;;
+    benchmark)
+        # 寫入專用合成資料前，核對資料卷登記及啟動中的網站與資料庫容器。
+        verify_project_containers
+        [ -f "$local_dir/runtime.env" ] || { printf '請先啟動該次負載環境。\n' >&2; exit 1; }
+        prepare_runtime
+        target="$(find_owned_volume)"
+        [ "$target" = "$volume" ] || { printf '找不到已核對的負載資料卷。\n' >&2; exit 1; }
+        db_id="$("${compose[@]}" ps --quiet db)"
+        app_id="$("${compose[@]}" ps --quiet app)"
+        # 透過可中斷的 wait 轉送訊號，避免 Bash 等到六分鐘量測結束才執行 trap。
+        trap 'stop_benchmark 129' HUP
+        trap 'stop_benchmark 130' INT
+        trap 'stop_benchmark 143' TERM
+        python3 bin/load-orders.py "$project" "$local_dir" "$db_id" "$app_id" &
+        wait "$!"
         ;;
     phpunit)
         # 測試僅接受 test 模式，容器內也會核對實際 PostgreSQL 資料庫。

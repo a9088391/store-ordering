@@ -98,3 +98,64 @@
 瀏覽器測試需要主機 Node.js 22.12 以上，預設使用 macOS 安裝的 Google Chrome。使用其他 Chrome 或 Chromium 時，可在執行 `npm run test:browser` 前設定 `CHROME_PATH`。瀏覽器流程會送出五次登入，相同來源重跑前請等上一個 60 秒限流時窗結束。如果測試在建單後中斷，先在隔離測試站查閱這次的測試訂單。待付款的訂單可取消或等候到期。若訂單已進入付款處理中，先用原訂單的「查詢付款結果」確認或補建同一筆付款。總部在「總部模擬付款」找到該筆付款，若仍待決定就按「決定失敗」。回原訂單再次查詢，確認付款失敗及保留釋放。核對可售量回到測試前的數量後，再重跑瀏覽器測試。
 
 實際服務的安全檢查可先取得 `GET /api/session` 的 cookie 與 `csrfToken`，再用同一 cookie 呼叫 `POST /api/login`。省略或改錯 `X-CSRF-TOKEN` 時應收到 `419 CSRF_MISMATCH`。正確登入後，對 `POST /api/logout` 分別省略或改錯 token，兩次都應回 419，且原 cookie 仍可查詢 `GET /api/stores`。使用正確 token 登出後，重送舊 cookie 查詢門市應回 `401 UNAUTHENTICATED`。Chrome 可分別以三個帳號登入，核對可選門市與庫存數量。
+
+### 負載驗收
+
+主機需有 Python 3.10 以上。先停止 8011 測試環境並確認 `127.0.0.1:8012` 可用。每次用新的識別建立專用 Compose 專案、資料卷與帳密。
+
+```sh
+load_mode="load-$(openssl rand -hex 6)"
+./bin/local "$load_mode" up
+project="store-ordering-$load_mode"
+evidence=".local/$load_mode"
+{
+    git rev-parse HEAD
+    python3 --version
+    docker version
+    docker compose version
+    docker exec "${project}-app-1" php --version
+    docker exec "${project}-app-1" php artisan --version
+    docker exec "${project}-db-1" postgres --version
+    for active_project in "$project" store-ordering; do
+        docker ps -q --filter "label=com.docker.compose.project=$active_project" |
+        while IFS= read -r id; do
+            docker inspect --format '{{.Name}} {{.Image}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$id"
+        done
+    done
+} > "$evidence/runtime.txt"
+```
+
+把主機型號、作業系統與記憶體也記入 `runtime.txt`。上面每個容器記錄映像、CPU 配額（十億分之一核心）及記憶體配額（位元組），核對本案合計不超過 4 CPU、6 GiB。先在另一個終端設為同一個 `load_mode`，開始記錄主機背景負載及五個容器的資源採樣。
+
+```sh
+project="store-ordering-$load_mode"
+while :; do
+    date -u
+    uptime
+    docker stats --no-stream "${project}-app-1" "${project}-db-1" "${project}-scheduler-1" \
+        "${project}-mock-payment-1" "${project}-mock-payment-scheduler-1"
+    sleep 5
+done > ".local/$load_mode/resources.log"
+```
+
+回到原終端執行負載。腳本只接受空白的專用交易資料庫，建立兩店共 10,000 筆已結束的合成訂單及足量測試庫存。暖機 60 秒後，正式排定 300 秒、每秒 20 次的訂單入口請求。正式工作包含清單 1,800 次、詳情 1,200 次、庫存 600 次，以及建單、發起付款、決定結果、通知各 600 次。兩店各 300 組交易，其中各有 240 組成功、60 組明確失敗。
+
+```sh
+./bin/local "$load_mode" benchmark
+```
+
+負載結束後，用 Ctrl+C 停止另一個終端的採樣。在移除容器前保存模擬金流的存取日誌，即使量測未通過也保留。依 `benchmark/summary.json` 的 UTC 暖機及正式時窗，分別統計 `/api/payments` 與 `/api/payments/{id}/decision` 的實際次數，並記下其他衍生呼叫。
+
+```sh
+docker logs --timestamps "${project}-mock-payment-1" > "$evidence/mock-access.log" 2>&1
+```
+
+確認日誌命令成功，且已保存版本、配額、主機負載和容器採樣，再移除容器。採集失敗時先保留容器以便補錄。
+
+```sh
+./bin/local "$load_mode" down
+```
+
+產生器以測試金鑰簽署模擬金流實際保存的事件本文，按排程送至訂單通知入口，量測驗簽及結算。金流的派送佇列、輪詢、重送、故障與競爭由獨立測試驗證。發起付款與決定結果引發的內部 HTTP 會佔用服務資源，其耗時也包含在入口量測內。
+
+`.local/$load_mode/benchmark/` 保存逐筆請求、未送出原因、兩個資料庫的一致性核對及摘要。腳本的通過訊息涵蓋正式流量與配比、交易完整性、讀取 p95 ≤500 毫秒、交易操作 p95 ≤1 秒、非預期錯誤率 <1% 和正確性錯誤為 0。完整驗收另須核對實際內部 HTTP、版本、配額與資源採樣。量測中斷或未通過時保留證據，重新驗收請使用新識別。`down` 保留資料卷與私密設定，供測後檢查。
