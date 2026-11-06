@@ -26,10 +26,11 @@ return Application::configure(basePath: dirname(__DIR__))
         api: $mockPayment ? __DIR__ . '/../routes/mock-payment.php' : null,
         health: '/up',
     )
-    // 每分鐘清理已到期的訂單；庫存讀取及開單仍各自即時檢查到期。
+    // 只有訂單服務每分鐘清理到期訂單及補辦付款；兩項作業使用本機訂單資料。
     ->withSchedule(function (Schedule $schedule) use ($mockPayment): void {
         if (!$mockPayment) {
             $schedule->command('store-ordering:expire-orders')->everyMinute();
+            $schedule->command('store-ordering:recover-payments')->everyMinute();
         }
     })
     // 讓 API 沿用 web session，並於授權前檢查會話期限。

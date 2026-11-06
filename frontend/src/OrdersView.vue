@@ -78,6 +78,7 @@ const pendingReasonLabels: Record<Exclude<PendingPaymentReason, null>, string> =
   service_unavailable: '模擬付款服務暫時無法使用',
   payment_not_found: '尚未查到遠端付款',
   invalid_response: '付款回應內容待確認',
+  recovery_exhausted: '自動補辦已達上限，請查詢付款結果。',
 }
 const anomalyLabels: Record<PaymentAnomaly['reason'], string> = {
   invalid_response: '付款回應無效',
@@ -118,7 +119,7 @@ const cancelFeedback = computed(() => {
   return detail.value ? '已讀取訂單狀態，目前無法取消。' : '取消結果尚未確認，請確認這筆訂單的詳情。'
 })
 
-// 未知結果以安全回讀的目前狀態說明，避免暗示已完成或自動重送。
+// 依安全回讀狀態提供下一步；處理中的付款仍可由背景補辦或手動查詢。
 const paymentFeedback = computed(() => {
   if (paymentResult.value === 'confirmed') {
     if (detail.value?.status === 'paid') return '已確認付款成功。'
@@ -133,15 +134,15 @@ const paymentFeedback = computed(() => {
   if (paymentResult.value === 'not-found') return '找不到這筆訂單，請重新讀取訂單清單。'
   if (paymentResult.value !== 'unknown') return ''
   if (detail.value?.status === 'awaiting_payment') {
-    return '付款操作結果尚未確認；訂單仍待付款。請確認訂單後再手動發起，系統不會自動重送。'
+    return '付款操作結果尚未確認。訂單仍待付款。請確認訂單後再手動發起。'
   }
   if (detail.value?.status === 'processing') {
-    return '付款操作結果尚未確認；同一筆付款仍在處理中。可手動查詢付款結果，系統不會自動重送。'
+    return '付款操作結果尚未確認。同一筆付款仍在處理中。可查看待處理原因或手動查詢付款結果。'
   }
   if (detail.value?.status === 'paid' || detail.value?.status === 'failed') {
     return `已回讀目前訂單狀態：${statusLabels[detail.value.status]}。可手動查詢最新付款結果。`
   }
-  return '付款結果尚未確認。請重新讀取訂單詳情後手動查詢；系統不會自動重送付款操作。'
+  return '付款結果尚未確認。請重新讀取訂單詳情，再依目前狀態操作。'
 })
 
 // 以同一組空值初始化或清除已套用的篩選條件。

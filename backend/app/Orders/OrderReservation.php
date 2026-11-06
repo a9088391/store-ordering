@@ -20,6 +20,8 @@ use LogicException;
 
 final class OrderReservation
 {
+    private const int MAX_RECOVERY_ATTEMPTS = 3;
+
     // 開單與庫存讀取在同一門市鎖下處理到期，確保可售量及歷程屬於同一個交易。
     public function inventory(int $storeId, PageData $page): LengthAwarePaginator
     {
@@ -187,7 +189,55 @@ final class OrderReservation
         });
     }
 
-    // 查詢與未來通知的結果套用集中於同一交易，避免終局反轉及重複扣除或釋放。
+    /**
+     * 每次以獨立 SQL 提交占用額度，再交給呼叫端外呼。程序中斷仍保留已占用的額度。
+     *
+     * @return iterable<array{PaymentData, int, int}> 依序回傳付款、門市識別及嘗試序號。
+     */
+    public function claimPaymentRecoveries(): iterable
+    {
+        // 分批讀取候選，先確認門市歸屬，外呼前不鎖定門市或訂單。
+        $candidates = $this
+            ->recoverablePaymentIntents()
+            ->join('orders', 'orders.id', '=', 'payment_intents.order_id')
+            ->select('payment_intents.*', 'orders.store_id')
+            ->lazyById(100, 'payment_intents.order_id', 'order_id');
+
+        // 同一 SQL 重查資格並增加計數，將下次可領取時間設為資料庫目前時間加一分鐘。
+        foreach ($candidates as $intent) {
+            $claimed = $this
+                ->recoverablePaymentIntents()
+                ->where('order_id', $intent->order_id)
+                ->where('recovery_attempts', $intent->recovery_attempts)
+                ->update([
+                    'recovery_attempts' => DB::raw('recovery_attempts + 1'),
+                    'next_recovery_at' => DB::raw("clock_timestamp() + interval '1 minute'"),
+                ]);
+            if ($claimed === 1) {
+                yield [
+                    PaymentData::fromRow($intent, 'pending'),
+                    (int) $intent->store_id,
+                    $intent->recovery_attempts + 1,
+                ];
+            }
+        }
+    }
+
+    // 尚未確認建立的付款須有剩餘額度，且已到可領取時間。
+    private function recoverablePaymentIntents(): Builder
+    {
+        return DB::table('payment_intents')
+            ->where('create_pending', true)
+            ->where('recovery_attempts', '<', self::MAX_RECOVERY_ATTEMPTS)
+            // 未確認建立且仍有額度時，時間為空表示可立即領取。
+            ->where(static function (Builder $query): void {
+                $query
+                    ->whereNull('next_recovery_at')
+                    ->orWhere('next_recovery_at', '<=', DB::raw('clock_timestamp()'));
+            });
+    }
+
+    // 人工查詢維持門市授權；回傳結果前在同一交易組裝詳情。
     public function applyPaymentObservation(
         User $actor,
         int $orderId,
@@ -196,54 +246,93 @@ final class OrderReservation
     ): OrderDetailData {
         $storeId = $this->authorizedStoreId($actor, $orderId);
 
-        // 外呼已結束；重新鎖定本機狀態，決定晚到的結果是否仍能套用。
+        // 外呼已結束，依門市、訂單順序重新取得鎖，讓結果與詳情一致。
         return DB::transaction(function () use ($storeId, $orderId, $observed, $pendingReason): OrderDetailData {
             $this->lockStore($storeId);
             $order = $this->lockOrder($orderId);
-            $intents = DB::table('payment_intents')->where('order_id', $orderId);
-            $intent = $intents->firstOrFail();
-            $processing = $order->status === 'processing';
-            $anomaly = match (true) {
-                $observed === null => $pendingReason === 'invalid_response' ? $pendingReason : null,
-                $observed->paymentId !== $intent->payment_id => 'payment_id_mismatch',
-                $observed->orderId !== $orderId => 'order_id_mismatch',
-                $observed->amount !== (int) $intent->amount => 'amount_mismatch',
-                $observed->currency !== $intent->currency => 'currency_mismatch',
-                !$processing && !in_array($observed->status, ['pending', $order->status], true) => 'terminal_conflict',
-                default => null,
-            };
-
-            // 異常只追加可讀原因；未知結果不清除建立待辦或原本的保留。
-            if ($anomaly !== null) {
-                DB::table('payment_anomalies')->insert([
-                    'order_id' => $orderId,
-                    'reason' => $anomaly,
-                    'occurred_at' => $this->sqlTime($this->databaseNow()),
-                ]);
-            }
-            if (!$processing) {
-                return $this->detail($order);
-            }
-            if ($observed === null || $anomaly !== null) {
-                $intents->update(['pending_reason' => $anomaly !== null ? 'invalid_response' : $pendingReason]);
-
-                return $this->detail($order);
-            }
-
-            // 綁定正確才能確認遠端存在；只有終局會改變庫存與訂單狀態。
-            $pending = $observed->status === 'pending';
-            $intents->update(['create_pending' => false, 'pending_reason' => $pending ? 'awaiting_result' : null]);
-            if (!$pending) {
-                $now = $this->databaseNow();
-                if ($observed->status === 'paid') {
-                    $this->deductStock($order, $now);
-                }
-                $this->release(DB::table('orders')->where('id', $orderId), $observed->status, $now);
-                $order->status = $observed->status;
-            }
+            $this->applyObservedPayment($order, $observed, $pendingReason);
 
             return $this->detail($order);
         });
+    }
+
+    // 以背景領取的門市及訂單進行結果套用，共用人工查詢的鎖序與庫存規則。
+    public function applyPaymentRecovery(
+        int $storeId,
+        int $orderId,
+        int $attempt,
+        ?PaymentData $observed,
+        ?string $pendingReason,
+    ): void {
+        // 僅在外呼完成後開啟交易；背景工作不需載入詳情。
+        DB::transaction(function () use ($storeId, $orderId, $attempt, $observed, $pendingReason): void {
+            $this->lockStore($storeId);
+            $order = $this->lockOrder($orderId);
+            $this->applyObservedPayment($order, $observed, $pendingReason, $attempt);
+        });
+    }
+
+    // 呼叫端持有門市及訂單鎖；集中檢查綁定與終局，避免重複扣除或釋放。
+    private function applyObservedPayment(
+        object $order,
+        ?PaymentData $observed,
+        ?string $pendingReason,
+        ?int $recoveryAttempt = null,
+    ): void {
+        // 核對已保存的不可變付款綁定，遠端回應不能替換訂單或金額。
+        $orderId = (int) $order->id;
+        $intents = DB::table('payment_intents')->where('order_id', $orderId);
+        $intent = $intents->firstOrFail();
+        $processing = $order->status === 'processing';
+        $anomaly = match (true) {
+            $observed === null => $pendingReason === 'invalid_response' ? $pendingReason : null,
+            $observed->paymentId !== $intent->payment_id => 'payment_id_mismatch',
+            $observed->orderId !== $orderId => 'order_id_mismatch',
+            $observed->amount !== (int) $intent->amount => 'amount_mismatch',
+            $observed->currency !== $intent->currency => 'currency_mismatch',
+            !$processing && !in_array($observed->status, ['pending', $order->status], true) => 'terminal_conflict',
+            default => null,
+        };
+
+        // 晚到的異常仍須追加可讀原因，但不改變已確認終局。
+        if ($anomaly !== null) {
+            DB::table('payment_anomalies')->insert([
+                'order_id' => $orderId,
+                'reason' => $anomaly,
+                'occurred_at' => $this->sqlTime($this->databaseNow()),
+            ]);
+        }
+        if (!$processing) {
+            return;
+        }
+
+        // 背景未知結果只能更新自己仍有效的待辦，避免蓋過已確認建立或較新嘗試。
+        if ($observed === null || $anomaly !== null) {
+            if ($recoveryAttempt !== null) {
+                $intents->where('create_pending', true)->where('recovery_attempts', $recoveryAttempt);
+            }
+            $intents->update(['pending_reason' => $anomaly !== null ? 'invalid_response' : $pendingReason]);
+
+            return;
+        }
+
+        // 綁定正確才確認遠端存在並清空下次可領取時間，已用額度仍保留。
+        $pending = $observed->status === 'pending';
+        $intents->update([
+            'create_pending' => false,
+            'pending_reason' => $pending ? 'awaiting_result' : null,
+            'next_recovery_at' => null,
+        ]);
+
+        // 只有終局會改變庫存與訂單狀態。
+        if (!$pending) {
+            $now = $this->databaseNow();
+            if ($observed->status === 'paid') {
+                $this->deductStock($order, $now);
+            }
+            $this->release(DB::table('orders')->where('id', $orderId), $observed->status, $now);
+            $order->status = $observed->status;
+        }
     }
 
     // 以開單快照綁定唯一付款；初始待辦和 processing 歷程與意圖必須一起提交。
@@ -354,13 +443,17 @@ final class OrderReservation
             ->orderBy('id')
             ->get(['product_id', 'quantity', 'type', 'occurred_at']);
 
-        // 付款狀態以訂單為準，與同一交易提交的異常、歷程及庫存一致。
+        // 由已支出的額度推導耗盡，即使最後一次外呼後未及更新原因也能從詳情讀到。
         $intent = DB::table('payment_intents')->where('order_id', $row->id)->first();
         $payment = $intent === null ? null : new OrderPaymentData(
             $intent->payment_id,
             $row->status === 'processing' ? 'pending' : $row->status,
-            $intent->pending_reason,
+            $intent->create_pending && $intent->recovery_attempts >= self::MAX_RECOVERY_ATTEMPTS
+                ? 'recovery_exhausted'
+                : $intent->pending_reason,
         );
+
+        // 只揭露可讀的異常原因及時間，保留既有的發生順序。
         $anomalies = DB::table('payment_anomalies')
             ->where('order_id', $row->id)
             ->orderBy('id')

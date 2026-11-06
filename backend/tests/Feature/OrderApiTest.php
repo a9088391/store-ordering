@@ -171,6 +171,231 @@ final class OrderApiTest extends TestCase
         $this->assertDatabaseCount('payment_intents', 1);
     }
 
+    // 三次背景補辦耗盡後仍保留庫存，人工查詢可用同一付款完成訂單。
+    public function testAutomaticPaymentRecoveryIsBoundedAndManualQueryStillSettles(): void
+    {
+        // 讓付款發起與三次背景補辦都遇到中斷，另記錄每次送出的原始綁定。
+        $this->insertFixture();
+        $this->authenticate(2);
+        $this->setDatabaseClock('2026-11-06 00:00:00+00');
+        $orderId = $this
+            ->createOrder('payment-recovery-budget', [['productId' => 1, 'quantity' => 3]])
+            ->assertCreated()
+            ->json('data.id');
+        $calls = [];
+        $settled = false;
+        // 模擬同一遠端付款直到最後一筆人工查詢才可讀到終局。
+        Http::fake(function (Request $request) use ($orderId, &$calls, &$settled): PromiseInterface {
+            $calls[] = [$request->method(), $request->url(), $request->data()];
+            // 最後一次背景外呼尚未回應就應顯示耗盡，避免中斷後沒有原因可讀。
+            if (count($calls) === 4) {
+                $this
+                    ->getJson("/api/orders/$orderId")
+                    ->assertOk()
+                    ->assertJsonPath('data.payment.pendingReason', 'recovery_exhausted');
+            }
+            if (!$settled) {
+                throw new ConnectionException('simulated lost request or response');
+            }
+
+            return Http::response(['data' => $calls[0][2] + ['status' => 'paid']]);
+        });
+        $paymentId = $this
+            ->postJson("/api/orders/$orderId/payment")
+            ->assertOk()
+            ->assertJsonPath('data.payment.pendingReason', 'service_unavailable')
+            ->json('data.payment.id');
+
+        // 每分鐘只可補辦一次；第四次排程及之後的執行都不能再送出。
+        foreach ([1 => 2, 2 => 3, 3 => 4, 4 => 4, 20 => 4] as $minute => $expectedCalls) {
+            $this->setDatabaseClock(sprintf('2026-11-06 00:%02d:00+00', $minute));
+            self::assertSame(0, Artisan::call('store-ordering:recover-payments'));
+            self::assertSame(0, Artisan::call('store-ordering:recover-payments'));
+            self::assertCount($expectedCalls, $calls);
+        }
+
+        // 耗盡後的未知查詢也應顯示耗盡原因，付款及庫存仍維持原本狀態。
+        $detail = $this->getJson("/api/orders/$orderId");
+        $query = $this->postJson("/api/orders/$orderId/payment/query");
+        foreach ([$detail, $query] as $pending) {
+            $pending
+                ->assertOk()
+                ->assertJsonPath('data.status', 'processing')
+                ->assertJsonPath('data.payment', [
+                    'id' => $paymentId, 'status' => 'pending', 'pendingReason' => 'recovery_exhausted',
+                ])
+                ->assertJsonCount(2, 'data.history')
+                ->assertJsonCount(1, 'data.stockLedger');
+        }
+        $this->postJson("/api/orders/$orderId/cancel")->assertConflict();
+        $this
+            ->getJson('/api/stores/1/inventory')
+            ->assertOk()
+            ->assertJsonPath('data.0.onHand', 12)
+            ->assertJsonPath('data.0.available', 9);
+
+        // 人工找回成功後只扣除及釋放一次，之後的排程不再外呼。
+        $settled = true;
+        $paid = $this
+            ->postJson("/api/orders/$orderId/payment/query")
+            ->assertOk()
+            ->assertJsonPath('data.status', 'paid')
+            ->assertJsonPath('data.payment', ['id' => $paymentId, 'status' => 'paid', 'pendingReason' => null])
+            ->assertJsonPath('data.history.2.status', 'paid')
+            ->assertJsonCount(3, 'data.history');
+        self::assertSame(['reserved', 'deducted', 'released'], array_column($paid->json('data.stockLedger'), 'type'));
+        self::assertSame(0, Artisan::call('store-ordering:recover-payments'));
+        $this->getJson("/api/orders/$orderId")->assertOk()->assertExactJson($paid->json());
+        $this
+            ->getJson('/api/stores/1/inventory')
+            ->assertOk()
+            ->assertJsonPath('data.0.onHand', 9)
+            ->assertJsonPath('data.0.available', 9);
+
+        // 所有自動建立僅重送一次 HTTP POST，人工查詢皆尋找同一付款。
+        $base = 'http://mock-payment:8000/api/payments';
+        $create = ['POST', $base, [
+            'paymentId' => $paymentId, 'orderId' => $orderId, 'amount' => 135, 'currency' => 'TWD',
+        ]];
+        $find = ['GET', "$base/$paymentId", []];
+        self::assertSame([$create, $create, $create, $create, $find, $find], $calls);
+        $this->assertDatabaseCount('payment_intents', 1);
+    }
+
+    // 人工已確認建立時，晚到的錯誤背景回應只留下異常，且不能覆蓋已確認的原因。
+    public function testLateRecoveryAnomalyPreservesConcurrentManualConfirmation(): void
+    {
+        // 初次外呼失敗，讓同一付款進入待補辦狀態。
+        $this->insertFixture();
+        $this->authenticate(2);
+        $this->setDatabaseClock('2026-11-06 00:00:00+00');
+        $orderId = $this
+            ->createOrder('payment-recovery-overlap', [['productId' => 1, 'quantity' => 3]])
+            ->assertCreated()
+            ->json('data.id');
+        $creates = [];
+        $lookups = [];
+        // 延遲背景回應直到人工查詢完成，以重現兩種回應交錯的順序。
+        Http::fake(function (Request $request) use ($orderId, &$creates, &$lookups): PromiseInterface {
+            if ($request->method() === 'GET') {
+                $lookups[] = $request->url();
+
+                return Http::response(['data' => $creates[0] + ['status' => 'pending']]);
+            }
+
+            // 背景補辦尚在外呼時，另一執行不能再占用相同待辦。
+            $creates[] = $request->data();
+            if (count($creates) === 1) {
+                throw new ConnectionException('simulated lost initial request');
+            }
+            self::assertCount(2, $creates);
+            self::assertSame(0, Artisan::call('store-ordering:recover-payments'));
+            self::assertCount(2, $creates);
+
+            // 回傳錯誤金額的終局，既不能扣庫存，也不能把已確認的付款改回未知。
+            $this
+                ->postJson("/api/orders/$orderId/payment/query")
+                ->assertOk()
+                ->assertJsonPath('data.payment.pendingReason', 'awaiting_result');
+
+            return Http::response(['data' => ['amount' => 136, 'status' => 'paid'] + $request->data()]);
+        });
+        $paymentId = $this
+            ->postJson("/api/orders/$orderId/payment")
+            ->assertOk()
+            ->assertJsonPath('data.payment.pendingReason', 'service_unavailable')
+            ->json('data.payment.id');
+        $this->setDatabaseClock('2026-11-06 00:01:00+00');
+        self::assertSame(0, Artisan::call('store-ordering:recover-payments'));
+
+        // 跨過租期仍不再自動建立；詳情及庫存只反映人工確認與異常紀錄。
+        $this->setDatabaseClock('2026-11-06 00:30:00+00');
+        self::assertSame(0, Artisan::call('store-ordering:recover-payments'));
+        self::assertSame([$creates[0], $creates[0]], $creates);
+        self::assertSame(["http://mock-payment:8000/api/payments/$paymentId"], $lookups);
+        $this
+            ->getJson("/api/orders/$orderId")
+            ->assertOk()
+            ->assertJsonPath('data.status', 'processing')
+            ->assertJsonPath('data.payment', [
+                'id' => $paymentId, 'status' => 'pending', 'pendingReason' => 'awaiting_result',
+            ])
+            ->assertJsonPath('data.anomalies.0.reason', 'amount_mismatch')
+            ->assertJsonCount(1, 'data.anomalies')
+            ->assertJsonCount(1, 'data.stockLedger');
+        $this
+            ->getJson('/api/stores/1/inventory')
+            ->assertOk()
+            ->assertJsonPath('data.0.onHand', 12)
+            ->assertJsonPath('data.0.available', 9);
+    }
+
+    // 遠端回傳正確的待處理或終局，背景都應關閉建立待辦，庫存只受已確認終局影響。
+    public function testRecoveryStopsAfterEitherPendingOrPaidConfirmation(): void
+    {
+        // 用兩張仍待補辦的原單測試同一次排程的兩種有效回應。
+        $this->insertFixture();
+        $this->authenticate(2);
+        $this->setDatabaseClock('2026-11-06 00:00:00+00');
+        $calls = [];
+        $statuses = [];
+        // 模擬遠端先拒絕初次外呼，之後以不同已保存狀態回答原付款識別。
+        Http::fake(static function (Request $request) use (&$calls, &$statuses): PromiseInterface {
+            $payload = $request->data();
+            $calls[] = [$request->method(), $request->url(), $payload];
+            $status = $statuses[$payload['paymentId']] ?? null;
+
+            return $status === null
+                ? Http::response([], 503)
+                : Http::response(['data' => $payload + ['status' => $status]]);
+        });
+        $orders = [];
+        foreach (['pending', 'paid'] as $status) {
+            $id = $this
+                ->createOrder("payment-recovery-$status", [['productId' => 1, 'quantity' => 3]])
+                ->assertCreated()
+                ->json('data.id');
+            $paymentId = $this
+                ->postJson("/api/orders/$id/payment")
+                ->assertOk()
+                ->assertJsonPath('data.payment.pendingReason', 'service_unavailable')
+                ->json('data.payment.id');
+            $orders[$status] = [$id, $paymentId];
+            $statuses[$paymentId] = $status;
+        }
+
+        // 第一次補辦應處理兩張訂單，隔一分鐘再次排程仍不能有新外呼。
+        $this->setDatabaseClock('2026-11-06 00:01:00+00');
+        self::assertSame(0, Artisan::call('store-ordering:recover-payments'));
+        $this->setDatabaseClock('2026-11-06 00:02:00+00');
+        self::assertSame(0, Artisan::call('store-ordering:recover-payments'));
+        self::assertSame([$calls[0], $calls[1]], array_slice($calls, 2));
+
+        // 待處理只保留原庫存；已付款只扣除及釋放一次。
+        [$pendingOrder, $pendingPayment] = $orders['pending'];
+        $this
+            ->getJson("/api/orders/$pendingOrder")
+            ->assertOk()
+            ->assertJsonPath('data.status', 'processing')
+            ->assertJsonPath('data.payment', [
+                'id' => $pendingPayment, 'status' => 'pending', 'pendingReason' => 'awaiting_result',
+            ])
+            ->assertJsonCount(1, 'data.stockLedger');
+        [$paidOrder, $paidPayment] = $orders['paid'];
+        $paid = $this
+            ->getJson("/api/orders/$paidOrder")
+            ->assertOk()
+            ->assertJsonPath('data.status', 'paid')
+            ->assertJsonPath('data.payment', ['id' => $paidPayment, 'status' => 'paid', 'pendingReason' => null])
+            ->assertJsonCount(3, 'data.history');
+        self::assertSame(['reserved', 'deducted', 'released'], array_column($paid->json('data.stockLedger'), 'type'));
+        $this
+            ->getJson('/api/stores/1/inventory')
+            ->assertOk()
+            ->assertJsonPath('data.0.onHand', 9)
+            ->assertJsonPath('data.0.available', 6);
+    }
+
     // 逐一拒絕錯誤綁定與非契約型別，確認失敗後晚到的待處理或相反終局不會反轉。
     public function testInvalidObservationsAndTerminalConflictPreserveStock(): void
     {

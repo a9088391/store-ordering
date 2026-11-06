@@ -8,6 +8,7 @@ use App\Http\Responses\OrderDetailData;
 use App\Models\User;
 use App\Orders\OrderConflict;
 use App\Orders\OrderReservation;
+use Illuminate\Http\Client\Response;
 
 final readonly class OrderPayments
 {
@@ -30,7 +31,29 @@ final readonly class OrderPayments
             $response = $this->mock->create($intent);
         }
 
-        // 錯誤回應或無法驗證的本文都維持未知，409 也須記下異常。
+        // 人工與背景回應沿用相同的解讀及驗證規則。
+        [$observed, $reason] = $this->interpret($response);
+
+        return $this->reservations->applyPaymentObservation($actor, $orderId, $observed, $reason);
+    }
+
+    // 已提交的待辦只補送原付款；冪等建立會回傳遠端先前保存的結果。
+    public function recover(): void
+    {
+        // 每次領取只對應一次 HTTP 請求；之後才以短交易套用回應。
+        foreach ($this->reservations->claimPaymentRecoveries() as [$intent, $storeId, $attempt]) {
+            [$observed, $reason] = $this->interpret($this->mock->create($intent));
+            $this->reservations->applyPaymentRecovery($storeId, $intent->orderId, $attempt, $observed, $reason);
+        }
+    }
+
+    /**
+     * 錯誤回應或無法解讀的本文維持未知，409 也須記下異常。
+     *
+     * @return array{?PaymentData, ?string} 解讀結果及未知原因。
+     */
+    private function interpret(?Response $response): array
+    {
         $observed = $response?->successful() ? PaymentData::fromResult($response->json('data')) : null;
         $reason = match (true) {
             $observed !== null => null,
@@ -39,6 +62,6 @@ final readonly class OrderPayments
             default => 'service_unavailable',
         };
 
-        return $this->reservations->applyPaymentObservation($actor, $orderId, $observed, $reason);
+        return [$observed, $reason];
     }
 }

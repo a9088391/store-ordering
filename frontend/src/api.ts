@@ -68,13 +68,16 @@ export interface OrderPage {
 }
 
 export type PaymentStatus = 'pending' | 'paid' | 'failed'
-export type PendingPaymentReason =
-  | 'creation_unconfirmed'
-  | 'awaiting_result'
-  | 'service_unavailable'
-  | 'payment_not_found'
-  | 'invalid_response'
-  | null
+const pendingPaymentReasons = [
+  null,
+  'creation_unconfirmed',
+  'awaiting_result',
+  'service_unavailable',
+  'payment_not_found',
+  'invalid_response',
+  'recovery_exhausted',
+] as const
+export type PendingPaymentReason = typeof pendingPaymentReasons[number]
 
 export interface OrderPayment {
   id: string
@@ -321,8 +324,7 @@ function hasCoherentPayment(order: OrderDetail): boolean {
     !payment
     || !isPaymentId(payment.id)
     || !['pending', 'paid', 'failed'].includes(payment.status)
-    || ![null, 'creation_unconfirmed', 'awaiting_result', 'service_unavailable', 'payment_not_found', 'invalid_response']
-      .includes(payment.pendingReason)
+    || !pendingPaymentReasons.includes(payment.pendingReason)
   ) return false
 
   if (order.status === 'processing') return payment.status === 'pending'

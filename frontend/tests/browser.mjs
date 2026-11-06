@@ -416,7 +416,7 @@ try {
       page.off('response', recordPaymentReadback)
       assert.equal(refreshSequence[0], paymentDetailPath)
       await page.getByRole('status').filter({
-        hasText: '付款操作結果尚未確認；同一筆付款仍在處理中。可手動查詢付款結果，系統不會自動重送。',
+        hasText: '付款操作結果尚未確認。同一筆付款仍在處理中。可查看待處理原因或手動查詢付款結果。',
       }).waitFor()
       assert.match(paymentId, /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i)
       assert.equal(await page.getByText(paymentId, { exact: true }).count(), 1)
