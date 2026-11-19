@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import { ApiError, getSession, login, logout, type Session } from './api'
-import HeadquartersPaymentsView from './HeadquartersPaymentsView.vue'
-import InventoryView from './InventoryView.vue'
+import StoreWorkspace from './StoreWorkspace.vue'
 
 type SessionCheck = 'login' | 'logout' | 'expired'
 
@@ -122,58 +121,54 @@ onUnmounted(() => lifetime.abort())
 </script>
 
 <template>
-  <main class="shell">
-    <h1>門市訂單系統</h1>
-    <p class="feedback" role="status">{{ feedback }}</p>
+  <!-- 驗證後才將帳號的門市工作區掛載，換人或登出時立即卸載。 -->
+  <StoreWorkspace
+    v-if="session?.user"
+    :key="session.user.id"
+    :role="session.user.role"
+    :actor-id="session.user.id"
+    :csrf-token="session.csrfToken"
+    :feedback="feedback"
+    @logout="changeSession('logout')"
+    @session-expired="refreshSession('expired')"
+  />
+  <main v-else class="sign-in">
+    <section class="login-panel" aria-labelledby="sign-in-heading">
+      <h1 id="sign-in-heading">門市訂單系統</h1>
+      <p v-if="feedback" role="status">{{ feedback }}</p>
 
-    <!-- 確認會話前不顯示登入表單或舊帳號的庫存。 -->
-    <section v-if="!session" class="panel" aria-label="登入狀態">
-      <p v-if="pending" role="status">正在確認登入狀態…</p>
-      <button v-else type="button" @click="refreshSession()">重試</button>
+      <!-- 確認會話前不顯示登入表單或舊帳號內容。 -->
+      <template v-if="!session">
+        <p v-if="pending" role="status">正在確認登入狀態…</p>
+        <button v-else type="button" @click="refreshSession()">重試</button>
+      </template>
+
+      <!-- 原生表單保留鍵盤提交、自動填寫及必填欄位提示。 -->
+      <template v-else>
+        <h2>登入</h2>
+        <form class="login-form" @submit.prevent="changeSession('login')">
+          <label for="email">帳號</label>
+          <input
+            id="email"
+            v-model="email"
+            type="email"
+            autocomplete="username"
+            maxlength="254"
+            required
+            :readonly="pending"
+          >
+          <label for="password">密碼</label>
+          <input
+            id="password"
+            v-model="password"
+            type="password"
+            autocomplete="current-password"
+            required
+            :readonly="pending"
+          >
+          <button type="submit" :disabled="pending">{{ pending ? '登入中…' : '登入' }}</button>
+        </form>
+      </template>
     </section>
-
-    <!-- 原生表單保留鍵盤提交、自動填寫及必填欄位提示。 -->
-    <section v-else-if="!session.user" class="panel" aria-labelledby="login-heading">
-      <h2 id="login-heading">登入</h2>
-      <form class="login-form" @submit.prevent="changeSession('login')">
-        <label for="email">帳號</label>
-        <input
-          id="email"
-          v-model="email"
-          type="email"
-          autocomplete="username"
-          maxlength="254"
-          required
-          :readonly="pending"
-        >
-        <label for="password">密碼</label>
-        <input
-          id="password"
-          v-model="password"
-          type="password"
-          autocomplete="current-password"
-          required
-          :readonly="pending"
-        >
-        <button type="submit" :disabled="pending">{{ pending ? '登入中…' : '登入' }}</button>
-      </form>
-    </section>
-
-    <!-- 每次確認身分後只載入該身分的授權清單。 -->
-    <InventoryView
-      v-else
-      :key="session.user.id"
-      :role="session.user.role"
-      :actor-id="session.user.id"
-      :csrf-token="session.csrfToken"
-      @logout="changeSession('logout')"
-      @session-expired="refreshSession('expired')"
-    />
-    <!-- 總部付款清單與門市選取分離，門市載入失敗時仍可獨立顯示。 -->
-    <HeadquartersPaymentsView
-      v-if="session?.user?.role === 'headquarters'"
-      :csrf-token="session.csrfToken"
-      @session-expired="refreshSession('expired')"
-    />
   </main>
 </template>

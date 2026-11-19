@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, shallowRef, useTemplateRef } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, shallowRef, useTemplateRef, watch } from 'vue'
 import {
   ApiError,
   decideMockPayment,
@@ -9,9 +9,10 @@ import {
   type MockPaymentPage,
   type PaymentDispatchMode,
 } from './api'
+import { needsSession } from './workspace'
 
-const props = defineProps<{ csrfToken: string }>()
-const emit = defineEmits<{ sessionExpired: [] }>()
+const props = defineProps<{ csrfToken: string; active: boolean }>()
+const emit = defineEmits<{ sessionExpired: []; busy: [active: boolean] }>()
 
 const perPage = 50
 const page = ref(1)
@@ -31,10 +32,8 @@ const statusLabels = { pending: '待決定', paid: '已付款', failed: '付款�
 const numberFormat = new Intl.NumberFormat('zh-TW')
 const busy = computed(() => actionPaymentId.value !== null)
 
-// 付款面板不讀取選取門市，僅以目前 HQ 會話查詢所有付款。
-function needsSession(error: unknown): boolean {
-  return error instanceof ApiError && (error.status === 401 || error.status === 419)
-}
+// 決定與派送未完成時，外層導覽需保留此畫面及請求。
+watch(busy, (active) => emit('busy', active), { flush: 'sync' })
 
 // 安全重讀目前有限頁；決定回應不明時只用 GET 核對，不再次送出決定。
 async function readPage(requestedPage = page.value): Promise<void> {
@@ -190,16 +189,19 @@ onBeforeUnmount(() => {
   listRead?.abort()
 })
 
-// 初始載入及手動重新讀取都只使用目前頁面。
-void readPage()
+// 每次回到面板都讀取目前付款頁；離開時取消不再顯示的唯讀請求。
+watch(() => props.active, (active) => {
+  if (active) void readPage()
+  else listRead?.abort()
+}, { immediate: true })
 </script>
 
 <template>
-  <section class="panel payment-panel" aria-labelledby="payments-heading">
-    <div class="panel-header">
-      <h2 id="payments-heading">總部模擬付款</h2>
+  <section class="payment-panel" aria-labelledby="payments-heading">
+    <header class="heading">
+      <h1 id="payments-heading" tabindex="-1">總部模擬付款</h1>
       <button class="secondary" type="button" :disabled="loading || busy" @click="readPage()">重新載入付款</button>
-    </div>
+    </header>
     <p v-if="feedback" ref="feedbackElement" tabindex="-1" role="status">{{ feedback }}</p>
     <p v-if="busy" role="status">{{ actionMode ? '正在排入通知派送…' : '正在決定模擬付款…' }}</p>
     <div v-if="loadError" class="retry">
@@ -208,53 +210,55 @@ void readPage()
     </div>
     <p v-else-if="loading" role="status">正在讀取模擬付款…</p>
     <p v-else-if="payments?.data.length === 0" role="status">目前沒有模擬付款。</p>
-    <table v-else-if="payments" aria-label="總部模擬付款清單">
-      <thead>
-        <tr>
-          <th scope="col">付款識別</th>
-          <th scope="col">訂單</th>
-          <th scope="col">金額</th>
-          <th scope="col">狀態</th>
-          <th scope="col">操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="payment in payments.data" :key="payment.paymentId">
-          <th scope="row" class="payment-id">{{ payment.paymentId }}</th>
-          <td>#{{ payment.orderId }}</td>
-          <td>{{ numberFormat.format(payment.amount) }} {{ payment.currency }}</td>
-          <td>{{ statusLabels[payment.status] }}</td>
-          <td>
-            <div v-if="payment.status === 'pending'" class="order-actions">
-              <button
-                type="button"
-                :disabled="busy || loading"
-                @click="decide(payment, 'paid')"
-              >{{ actionPaymentId === payment.paymentId ? '決定中…' : '決定成功' }}</button>
-              <button
-                class="secondary"
-                type="button"
-                :disabled="busy || loading"
-                @click="decide(payment, 'failed')"
-              >{{ actionPaymentId === payment.paymentId ? '決定中…' : '決定失敗' }}</button>
-            </div>
-            <div v-else class="order-actions">
-              <button
-                type="button"
-                :disabled="busy || loading"
-                @click="dispatch(payment, 'immediate')"
-              >{{ actionPaymentId === payment.paymentId && actionMode === 'immediate' ? '排入中…' : '立即送出／重送' }}</button>
-              <button
-                class="secondary"
-                type="button"
-                :disabled="busy || loading"
-                @click="dispatch(payment, 'delayed')"
-              >{{ actionPaymentId === payment.paymentId && actionMode === 'delayed' ? '排入中…' : '延遲 60 秒送出' }}</button>
-            </div>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div v-else-if="payments" class="table-wrap" tabindex="0" role="region" aria-label="模擬付款表格">
+      <table class="payments-table" aria-label="總部模擬付款清單">
+        <thead>
+          <tr>
+            <th scope="col">付款識別</th>
+            <th scope="col">訂單</th>
+            <th scope="col" class="num">金額</th>
+            <th scope="col">狀態</th>
+            <th scope="col">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="payment in payments.data" :key="payment.paymentId">
+            <th scope="row" class="payment-id">{{ payment.paymentId }}</th>
+            <td>#{{ payment.orderId }}</td>
+            <td class="num">{{ payment.currency }} {{ numberFormat.format(payment.amount) }}</td>
+            <td><span class="status" :class="payment.status">{{ statusLabels[payment.status] }}</span></td>
+            <td>
+              <div v-if="payment.status === 'pending'" class="actions">
+                <button
+                  type="button"
+                  :disabled="busy || loading"
+                  @click="decide(payment, 'paid')"
+                >{{ actionPaymentId === payment.paymentId ? '決定中…' : '決定成功' }}</button>
+                <button
+                  class="secondary"
+                  type="button"
+                  :disabled="busy || loading"
+                  @click="decide(payment, 'failed')"
+                >{{ actionPaymentId === payment.paymentId ? '決定中…' : '決定失敗' }}</button>
+              </div>
+              <div v-else class="actions">
+                <button
+                  type="button"
+                  :disabled="busy || loading"
+                  @click="dispatch(payment, 'immediate')"
+                >{{ actionPaymentId === payment.paymentId && actionMode === 'immediate' ? '排入中…' : '立即送出／重送' }}</button>
+                <button
+                  class="secondary"
+                  type="button"
+                  :disabled="busy || loading"
+                  @click="dispatch(payment, 'delayed')"
+                >{{ actionPaymentId === payment.paymentId && actionMode === 'delayed' ? '排入中…' : '延遲 60 秒送出' }}</button>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
     <nav v-if="lastPage > 1" class="pagination" aria-label="模擬付款分頁">
       <button class="secondary" type="button" :disabled="page === 1 || loading || busy" @click="changePage(page - 1)">上一頁</button>
       <span>第 {{ page }} / {{ lastPage }} 頁 · 共 {{ payments?.meta.total ?? 0 }} 筆</span>

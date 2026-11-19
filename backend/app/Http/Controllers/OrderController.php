@@ -8,28 +8,48 @@ use App\Http\Requests\OrderDraft;
 use App\Http\Responses\OrderData;
 use App\Http\Responses\PageData;
 use App\Orders\OrderConflict;
+use App\Orders\OrderListFilters;
+use App\Orders\OrderListQuery;
 use App\Orders\OrderReservation;
 use App\Payments\OrderPayments;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 
 final class OrderController
 {
-    // 訂單保留與付款共用庫存交易，付款另處理交易之外的遠端通訊。
+    // 訂單保留與付款維持既有服務；清單查詢唯讀，付款另處理交易外的遠端通訊。
     public function __construct(
         private readonly OrderReservation $reservations,
         private readonly OrderPayments $payments,
+        private readonly OrderListQuery $orderList,
     ) {
     }
 
     // 先驗證篩選及門市權限，再依建立時間及訂單識別取得穩定頁面。
     public function index(Request $request): JsonResponse
     {
-        // 查詢參數是字串，識別限定為十進位正整數，日期限定為有效的年月日。
         $query = $request->query();
+
+        // 共用分頁驗證先於清單篩選，以維持同時無效時的錯誤優先順序。
         $page = PageData::fromQuery($query);
+        $filters = $this->listFilters($query);
+
+        // 將已驗證條件與登入身分交由唯讀查詢處理，重用既有門市隔離。
+        $orders = $this->orderList->handle(
+            $request->user(),
+            $filters,
+            page: $page->page,
+            perPage: $page->perPage,
+        );
+
+        // 清單沿用原訂單欄位映射及共用分頁回應。
+        return $page->response($orders, OrderData::fromRow(...));
+    }
+
+    // 以既有規則驗證篩選，再把字串識別轉成安全整數。
+    private function listFilters(array $query): OrderListFilters
+    {
         $idRules = ['sometimes', 'bail', 'regex:/\A[1-9][0-9]*\z/', 'integer', 'max:9007199254740991'];
         $dateRules = ['sometimes', 'bail', 'regex:/\A(?!0000)[0-9]{4}-[0-9]{2}-[0-9]{2}\z/', 'date_format:Y-m-d'];
         $filters = Validator::make($query, [
@@ -40,41 +60,13 @@ final class OrderController
             'to' => $dateRules,
         ])->validate();
 
-        // 店員省略門市也只會看到自己的門市；明確越權的門市與不存在同樣回 404。
-        $actor = $request->user();
-        $orders = $actor->restrictStores(DB::table('orders'), 'store_id');
-        if (isset($filters['storeId'])) {
-            $storeId = (int) $filters['storeId'];
-            if (!$actor->canAccessStore($storeId)) {
-                abort(404);
-            }
-            $orders->where('store_id', $storeId);
-        }
-        if (isset($filters['orderNumber'])) {
-            $orders->where('id', (int) $filters['orderNumber']);
-        }
-        if (isset($filters['status'])) {
-            $orders->where('status', $filters['status']);
-        }
-
-        // 以台北時區的日界線比對 UTC 建立時間，起日包含、迄日不包含。
-        if (isset($filters['from'])) {
-            $orders->whereRaw(
-                "created_at >= CAST(? AS date)::timestamp AT TIME ZONE 'Asia/Taipei'",
-                [$filters['from']],
-            );
-        }
-        if (isset($filters['to'])) {
-            $orders->whereRaw("created_at < CAST(? AS date)::timestamp AT TIME ZONE 'Asia/Taipei'", [$filters['to']]);
-        }
-
-        // 同一時間的訂單以識別降冪固定先後，跨頁不因排序相同而改變順序。
-        $orders = $orders
-            ->orderByDesc('created_at')
-            ->orderByDesc('id')
-            ->paginate($page->perPage, page: $page->page);
-
-        return $page->response($orders, OrderData::fromRow(...));
+        return new OrderListFilters(
+            isset($filters['storeId']) ? (int) $filters['storeId'] : null,
+            isset($filters['orderNumber']) ? (int) $filters['orderNumber'] : null,
+            $filters['status'] ?? null,
+            $filters['from'] ?? null,
+            $filters['to'] ?? null,
+        );
     }
 
     // 先驗證輸入及門市範圍，再依是否重送回傳不同的成功狀態。
